@@ -1,0 +1,6 @@
+{
+  "OPERATION_MODE": "Transmit",
+  "ENABLE_DEBUG_LOGS": false,
+  "SHOW_DEBUG_PANEL": false,
+  "ENVIRONMENT": "production"
+}

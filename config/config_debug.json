@@ -1,0 +1,6 @@
+{
+  "OPERATION_MODE": "Standby",
+  "ENABLE_DEBUG_LOGS": true,
+  "SHOW_DEBUG_PANEL": true,
+  "ENVIRONMENT": "debug"
+}

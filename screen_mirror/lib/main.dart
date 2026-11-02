@@ -1,5 +1,10 @@
 import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+
+import 'debug_services.dart';
+import 'screen_capture_service.dart';
 
 void main() {
   runApp(const WatcherTerminalApp());
@@ -33,27 +38,35 @@ class TerminalDashboard extends StatefulWidget {
 
 class _TerminalDashboardState extends State<TerminalDashboard> {
   // Compile-time environment flags loaded via --dart-define-from-file
-  static const String _envMode = String.fromEnvironment('OPERATION_MODE', defaultValue: 'Standby');
-  static const bool _envDebugLogs = bool.fromEnvironment('ENABLE_DEBUG_LOGS', defaultValue: false);
-  static const bool _showDebugPanel = bool.fromEnvironment('SHOW_DEBUG_PANEL', defaultValue: false);
+  static const String _envMode = String.fromEnvironment(
+    'OPERATION_MODE',
+    defaultValue: 'Standby',
+  );
+  static const bool _envDebugLogs = bool.fromEnvironment(
+    'ENABLE_DEBUG_LOGS',
+    defaultValue: false,
+  );
+  static const bool _showDebugPanel = bool.fromEnvironment(
+    'SHOW_DEBUG_PANEL',
+    defaultValue: false,
+  );
 
   final List<String> _logs = [];
   final ScrollController _scrollController = ScrollController();
-  
+
   bool _isStreaming = false;
   late String _activeMode;
   final String _commType = 'Auto (USB preferred)';
-  
+
   StreamSubscription? _eventSubscription;
-  Timer? _screencapTimer;
   bool _initialized = false;
-
-  // Mock discovered nodes for debug mode
-  final List<Map<String, String>> _discoveredNodes = [
-    {'id': 'watcher_node_alpha', 'ip': '192.168.1.105', 'transport': 'USB (Direct)'},
-    {'id': 'watcher_node_beta', 'ip': '192.168.1.112', 'transport': 'Wi-Fi (UDP)'},
-  ];
-
+  final ScreenCaptureService _screenCaptureService = ScreenCaptureService();
+  late final LocalPeerDiscovery _peerDiscovery;
+  bool _isCapturing = false;
+  bool _isDiscovering = false;
+  Uint8List? _screenshot;
+  List<DiscoveredNode> _networkNodes = [];
+  List<AdbDevice> _adbDevices = [];
   int _screencapCount = 0;
   String _lastScreencapTime = 'Never';
 
@@ -61,6 +74,16 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   void initState() {
     super.initState();
     _activeMode = _envMode;
+    _peerDiscovery = LocalPeerDiscovery(
+      onNodesChanged: (nodes) {
+        if (mounted) {
+          setState(() => _networkNodes = nodes);
+        }
+      },
+      onError: (error) {
+        if (mounted) _logEvent('[Discovery error] $error');
+      },
+    );
   }
 
   @override
@@ -74,7 +97,9 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       }
       if (_showDebugPanel) {
         _logEvent('[DEBUG] Debug panel enabled via config profile.');
-        _startScreencapTimer();
+        _logEvent(
+          '[DEBUG] Screen capture and peer discovery require explicit user action.',
+        );
       }
     }
   }
@@ -82,25 +107,100 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   @override
   void dispose() {
     _eventSubscription?.cancel();
-    _screencapTimer?.cancel();
+    unawaited(_peerDiscovery.stop());
     _scrollController.dispose();
     super.dispose();
   }
 
-  void _startScreencapTimer() {
-    // Live screencap simulation once every 10 seconds
-    _screencapTimer = Timer.periodic(const Duration(seconds: 10), (timer) {
+  Future<void> _captureScreen() async {
+    setState(() => _isCapturing = true);
+    _logEvent(
+      '[Capture] Screen capture requested. Approve the system prompt if shown.',
+    );
+    try {
+      final image = await _screenCaptureService.captureCurrentScreen();
+      if (!mounted) return;
       setState(() {
+        _screenshot = image;
         _screencapCount++;
-        _lastScreencapTime = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
+        _lastScreencapTime = DateTime.now().toLocal().toString().substring(
+          11,
+          19,
+        );
       });
-      _logEvent('[Debug HAL] Live screencap captured successfully (#$_screencapCount). Frame size: 1.2 MB.');
-    });
+      _logEvent(
+        '[Capture] Screen captured in memory (#$_screencapCount); temporary capture data was removed.',
+      );
+    } catch (error) {
+      if (mounted) {
+        _logEvent('[Capture error] $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isCapturing = false);
+      }
+    }
+  }
+
+  Future<void> _toggleDeviceDiscovery() async {
+    if (_isDiscovering) {
+      try {
+        await _peerDiscovery.stop();
+        if (!mounted) return;
+        setState(() {
+          _isDiscovering = false;
+          _networkNodes = [];
+        });
+        _logEvent('[Discovery] Local peer discovery stopped.');
+      } catch (error) {
+        if (mounted) _logEvent('[Discovery error] $error');
+      }
+      return;
+    }
+
+    setState(() => _isDiscovering = true);
+    _logEvent(
+      '[Discovery] Starting opted-in MLRC peer discovery on the local network.',
+    );
+    try {
+      await _peerDiscovery.start();
+      if (mounted) {
+        _logEvent('[Discovery] Local service discovery is active.');
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _isDiscovering = false);
+        _logEvent('[Discovery error] $error');
+      }
+    }
+
+    if (!mounted) return;
+    if (Theme.of(context).platform == TargetPlatform.android) {
+      _logEvent(
+        '[USB] ADB discovery is available when the app runs on a Windows or Linux host.',
+      );
+      return;
+    }
+
+    try {
+      final devices = await findAdbDevices();
+      if (!mounted) return;
+      setState(() => _adbDevices = devices);
+      _logEvent('[USB] ADB reported ${devices.length} connected device(s).');
+    } catch (error) {
+      if (mounted) {
+        _logEvent('[USB discovery error] $error');
+      }
+    }
   }
 
   void _logEvent(String message) {
     setState(() {
-      final timestamp = DateTime.now().toIso8601String().split('T').last.substring(0, 8);
+      final timestamp = DateTime.now()
+          .toIso8601String()
+          .split('T')
+          .last
+          .substring(0, 8);
       _logs.add('[$timestamp] $message');
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -134,239 +234,461 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   }
 
   void _simulateWatcherEvents() {
-    _eventSubscription = Stream.periodic(const Duration(seconds: 2), (_) {}).listen((_) {
-      if (!_isStreaming) return;
+    _eventSubscription = Stream.periodic(const Duration(seconds: 2), (_) {})
+        .listen((_) {
+          if (!_isStreaming) return;
 
-      if (_activeMode == 'Transmit') {
-        _logEvent('[Network] USB bulk endpoint active. Transmitting video frame chunk...');
-        _logEvent('[Display HAL] Captured frame from capture source successfully.');
-      } else {
-        _logEvent('[Network] Polling fallback Wi-Fi socket (UDP)... Packet received.');
-        _logEvent('[Display HAL] Rendered incoming frame buffer to display surface.');
-      }
-    });
+          if (_activeMode == 'Transmit') {
+            _logEvent(
+              '[Network] USB bulk endpoint active. Transmitting video frame chunk...',
+            );
+            _logEvent(
+              '[Display HAL] Captured frame from capture source successfully.',
+            );
+          } else {
+            _logEvent(
+              '[Network] Polling fallback Wi-Fi socket (UDP)... Packet received.',
+            );
+            _logEvent(
+              '[Display HAL] Rendered incoming frame buffer to display surface.',
+            );
+          }
+        });
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_showDebugPanel ? 'AV Watcher Control Terminal [DEBUG MODE]' : 'AV Watcher Control Terminal'),
-        backgroundColor: _showDebugPanel ? const Color(0xFF7C2D12) : const Color(0xFF1E293B),
+        title: Text(
+          _showDebugPanel
+              ? 'AV Watcher Control Terminal [DEBUG MODE]'
+              : 'AV Watcher Control Terminal',
+        ),
+        backgroundColor: _showDebugPanel
+            ? const Color(0xFF7C2D12)
+            : const Color(0xFF1E293B),
         elevation: 0,
       ),
       body: Padding(
         padding: const EdgeInsets.all(16.0),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Left Column: Main Dashboard Control & Terminal
-            Expanded(
-              flex: 3,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // Status Cards Header
-                  Row(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 900;
+            final isAndroid =
+                Theme.of(context).platform == TargetPlatform.android;
+            return Flex(
+              direction: compact ? Axis.vertical : Axis.horizontal,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Left Column: Main Dashboard Control & Terminal
+                Expanded(
+                  flex: 3,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      _buildStatusCard('Operation Mode', _activeMode, Icons.settings_input_component),
-                      const SizedBox(width: 12),
-                      _buildStatusCard('Comm Channel', _commType, Icons.usb),
-                      const SizedBox(width: 12),
-                      _buildStatusCard('Status', _isStreaming ? 'ACTIVE' : 'IDLE', 
-                        _isStreaming ? Icons.fiber_manual_record : Icons.pause_circle_outline,
-                        color: _isStreaming ? Colors.greenAccent : Colors.orangeAccent),
-                    ],
-                  ),
-                  const SizedBox(height: 16),
-                  
-                  // Action Buttons
-                  Row(
-                    children: [
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: () => _toggleWatcher('Transmit'),
-                          icon: Icon(_isStreaming && _activeMode == 'Transmit' ? Icons.stop : Icons.upload),
-                          label: Text(_isStreaming && _activeMode == 'Transmit' ? 'Stop Transmitting' : 'Start Transmitting'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _isStreaming && _activeMode == 'Transmit' ? Colors.redAccent : Colors.blueAccent,
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: ElevatedButton.icon(
-                          onPressed: () => _toggleWatcher('Receive'),
-                          icon: Icon(_isStreaming && _activeMode == 'Receive' ? Icons.stop : Icons.download),
-                          label: Text(_isStreaming && _activeMode == 'Receive' ? 'Stop Receiving' : 'Start Receiving'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: _isStreaming && _activeMode == 'Receive' ? Colors.redAccent : Colors.teal,
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-
-                  // Terminal Console Header
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Text('Event Stream Terminal', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-                      TextButton.icon(
-                        onPressed: () => setState(() => _logs.clear()),
-                        icon: const Icon(Icons.clear_all, size: 16),
-                        label: const Text('Clear Logs'),
-                      )
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-
-                  // Terminal Console Box
-                  Expanded(
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.white12),
-                      ),
-                      child: ListView.builder(
-                        controller: _scrollController,
-                        itemCount: _logs.length,
-                        itemBuilder: (context, index) {
-                          final log = _logs[index];
-                          Color textColor = Colors.white70;
-                          if (log.contains('Network')) textColor = const Color(0xFF38BDF8);
-                          if (log.contains('Display HAL')) textColor = const Color(0xFF4ADE80);
-                          if (log.contains('System') || log.contains('Debug')) textColor = const Color(0xFFFACC15);
-
-                          return Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 2.0),
-                            child: Text(
-                              log,
-                              style: TextStyle(fontFamily: 'monospace', fontSize: 13, color: textColor),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-            // Right Column: Conditional Debug Panel (Only shows if SHOW_DEBUG_PANEL is true)
-            if (_showDebugPanel) ...[
-              const SizedBox(width: 16),
-              Expanded(
-                flex: 2,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Text('Debug Inspector Panel', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.amberAccent)),
-                    const SizedBox(height: 8),
-                    
-                    // Discovered Network Nodes Section
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF1E293B),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.amber.withOpacity(0.3)),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                      // Status Cards Header
+                      Row(
                         children: [
-                          const Row(
-                            children: [
-                              Icon(Icons.hub, size: 16, color: Colors.amberAccent),
-                              SizedBox(width: 8),
-                              Text('Available Nodes on Network', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                            ],
+                          _buildStatusCard(
+                            'Operation Mode',
+                            _activeMode,
+                            Icons.settings_input_component,
                           ),
-                          const Divider(color: Colors.white24),
-                          ..._discoveredNodes.map((node) => Padding(
-                            padding: const EdgeInsets.symmetric(vertical: 4.0),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text(node['id']!, style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-                                Text(node['ip']!, style: const TextStyle(fontSize: 12, color: Colors.white60)),
-                              ],
-                            ),
-                          )),
+                          const SizedBox(width: 12),
+                          _buildStatusCard(
+                            'Comm Channel',
+                            _commType,
+                            Icons.usb,
+                          ),
+                          const SizedBox(width: 12),
+                          _buildStatusCard(
+                            'Status',
+                            _isStreaming ? 'ACTIVE' : 'IDLE',
+                            _isStreaming
+                                ? Icons.fiber_manual_record
+                                : Icons.pause_circle_outline,
+                            color: _isStreaming
+                                ? Colors.greenAccent
+                                : Colors.orangeAccent,
+                          ),
                         ],
                       ),
-                    ),
-                    const SizedBox(height: 16),
+                      const SizedBox(height: 16),
 
-                    // Live Screencap Preview Section (Updates every 10s)
-                    Expanded(
-                      child: Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF1E293B),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.amber.withOpacity(0.3)),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Row(
-                                  children: [
-                                    Icon(Icons.camera, size: 16, color: Colors.amberAccent),
-                                    SizedBox(width: 8),
-                                    Text('Live Screencap (10s interval)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                                  ],
-                                ),
-                                Text('#$_screencapCount', style: const TextStyle(color: Colors.amberAccent, fontSize: 12)),
-                              ],
-                            ),
-                            const Divider(color: Colors.white24),
-                            Expanded(
-                              child: Center(
-                                child: Container(
-                                  width: double.infinity,
-                                  decoration: BoxDecoration(
-                                    color: Colors.black,
-                                    borderRadius: BorderRadius.circular(6),
-                                    border: Border.all(color: Colors.white10),
-                                  ),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      const Icon(Icons.monitor, size: 48, color: Colors.white24),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        _screencapCount == 0 ? 'Waiting for first capture...' : 'Last Capture: $_lastScreencapTime',
-                                        style: const TextStyle(fontSize: 11, color: Colors.white60),
-                                      ),
-                                    ],
-                                  ),
+                      // Action Buttons
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              onPressed: () => _toggleWatcher('Transmit'),
+                              icon: Icon(
+                                _isStreaming && _activeMode == 'Transmit'
+                                    ? Icons.stop
+                                    : Icons.upload,
+                              ),
+                              label: Text(
+                                _isStreaming && _activeMode == 'Transmit'
+                                    ? 'Stop Transmitting'
+                                    : 'Start Transmitting',
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor:
+                                    _isStreaming && _activeMode == 'Transmit'
+                                    ? Colors.redAccent
+                                    : Colors.blueAccent,
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
                                 ),
                               ),
                             ),
-                          ],
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: ElevatedButton.icon(
+                              onPressed: () => _toggleWatcher('Receive'),
+                              icon: Icon(
+                                _isStreaming && _activeMode == 'Receive'
+                                    ? Icons.stop
+                                    : Icons.download,
+                              ),
+                              label: Text(
+                                _isStreaming && _activeMode == 'Receive'
+                                    ? 'Stop Receiving'
+                                    : 'Start Receiving',
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor:
+                                    _isStreaming && _activeMode == 'Receive'
+                                    ? Colors.redAccent
+                                    : Colors.teal,
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 14,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+
+                      // Terminal Console Header
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            'Event Stream Terminal',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: () => setState(() => _logs.clear()),
+                            icon: const Icon(Icons.clear_all, size: 16),
+                            label: const Text('Clear Logs'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+
+                      // Terminal Console Box
+                      Expanded(
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.white12),
+                          ),
+                          child: ListView.builder(
+                            controller: _scrollController,
+                            itemCount: _logs.length,
+                            itemBuilder: (context, index) {
+                              final log = _logs[index];
+                              Color textColor = Colors.white70;
+                              if (log.contains('Network')) {
+                                textColor = const Color(0xFF38BDF8);
+                              }
+                              if (log.contains('Display HAL')) {
+                                textColor = const Color(0xFF4ADE80);
+                              }
+                              if (log.contains('System') ||
+                                  log.contains('Debug')) {
+                                textColor = const Color(0xFFFACC15);
+                              }
+
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 2.0,
+                                ),
+                                child: Text(
+                                  log,
+                                  style: TextStyle(
+                                    fontFamily: 'monospace',
+                                    fontSize: 13,
+                                    color: textColor,
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
-          ],
+
+                // Right Column: Conditional Debug Panel (Only shows if SHOW_DEBUG_PANEL is true)
+                if (_showDebugPanel) ...[
+                  SizedBox(width: compact ? 0 : 16, height: compact ? 16 : 0),
+                  Expanded(
+                    flex: 2,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Debug Inspector Panel',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                            color: Colors.amberAccent,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+
+                        // Network discovery panel
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF1E293B),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: Colors.amber.withValues(alpha: 0.3),
+                            ),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Row(
+                                children: [
+                                  const Expanded(
+                                    child: Text(
+                                      'Available MLRC peers',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ),
+                                  TextButton.icon(
+                                    onPressed: _toggleDeviceDiscovery,
+                                    icon: Icon(
+                                      _isDiscovering
+                                          ? Icons.stop
+                                          : Icons.search,
+                                      size: 16,
+                                    ),
+                                    label: Text(
+                                      _isDiscovering ? 'Stop' : 'Discover',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const Text(
+                                'Discovers opted-in MLRC apps on this LAN; desktop hosts also list USB-connected Android devices with ADB.',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.white60,
+                                ),
+                              ),
+                              const Divider(color: Colors.white24),
+                              if (_networkNodes.isEmpty && _adbDevices.isEmpty)
+                                Text(
+                                  _isDiscovering
+                                      ? isAndroid
+                                            ? 'Searching for peers...'
+                                            : 'Searching for peers and USB devices...'
+                                      : 'Discovery has not been started.',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.white60,
+                                  ),
+                                ),
+                              ..._networkNodes.map(
+                                (node) => _buildNodeRow(
+                                  Icons.wifi,
+                                  node.id,
+                                  '${node.address}:${node.port}',
+                                ),
+                              ),
+                              ..._adbDevices.map(
+                                (device) => _buildNodeRow(
+                                  Icons.usb,
+                                  device.description,
+                                  '${device.serial} (${device.status})',
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 16),
+
+                        // User-triggered screen capture preview
+                        Expanded(
+                          child: Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF1E293B),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: Colors.amber.withValues(alpha: 0.3),
+                              ),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    const Expanded(
+                                      child: Text(
+                                        'Current screen preview',
+                                        style: TextStyle(
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                    ),
+                                    TextButton.icon(
+                                      onPressed: _isCapturing
+                                          ? null
+                                          : _captureScreen,
+                                      icon: _isCapturing
+                                          ? const SizedBox(
+                                              width: 14,
+                                              height: 14,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(
+                                              Icons.camera_alt,
+                                              size: 16,
+                                            ),
+                                      label: Text(
+                                        _isCapturing ? 'Capturing' : 'Capture',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                                const Divider(color: Colors.white24),
+                                Expanded(
+                                  child: Center(
+                                    child: Container(
+                                      width: double.infinity,
+                                      height: double.infinity,
+                                      decoration: BoxDecoration(
+                                        color: Colors.black,
+                                        borderRadius: BorderRadius.circular(6),
+                                        border: Border.all(
+                                          color: Colors.white10,
+                                        ),
+                                      ),
+                                      child: _screenshot == null
+                                          ? const Center(
+                                              child: Text(
+                                                'Capture starts only when requested.\nPreview stays in memory.',
+                                                textAlign: TextAlign.center,
+                                                style: TextStyle(
+                                                  fontSize: 11,
+                                                  color: Colors.white60,
+                                                ),
+                                              ),
+                                            )
+                                          : ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(6),
+                                              child: Image.memory(
+                                                _screenshot!,
+                                                fit: BoxFit.contain,
+                                                errorBuilder:
+                                                    (
+                                                      context,
+                                                      error,
+                                                      stackTrace,
+                                                    ) => const Center(
+                                                      child: Text(
+                                                        'Could not display captured image.',
+                                                      ),
+                                                    ),
+                                              ),
+                                            ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                Text(
+                                  _screencapCount == 0
+                                      ? 'Last capture: Never'
+                                      : 'Capture #$_screencapCount at $_lastScreencapTime',
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.white60,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            );
+          },
         ),
       ),
     );
   }
 
-  Widget _buildStatusCard(String title, String value, IconData icon, {Color color = Colors.white}) {
+  Widget _buildNodeRow(IconData icon, String name, String details) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: Colors.amberAccent),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12),
+                ),
+                Text(
+                  details,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11, color: Colors.white60),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatusCard(
+    String title,
+    String value,
+    IconData icon, {
+    Color color = Colors.white,
+  }) {
     return Expanded(
       child: Container(
         padding: const EdgeInsets.all(12),
@@ -382,13 +704,20 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
               children: [
                 Icon(icon, size: 16, color: Colors.white54),
                 const SizedBox(width: 6),
-                Text(title, style: const TextStyle(fontSize: 12, color: Colors.white54)),
+                Text(
+                  title,
+                  style: const TextStyle(fontSize: 12, color: Colors.white54),
+                ),
               ],
             ),
             const SizedBox(height: 8),
             Text(
               value,
-              style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: color),
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
               overflow: TextOverflow.ellipsis,
             ),
           ],

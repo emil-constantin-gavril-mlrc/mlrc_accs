@@ -57,6 +57,32 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
+find_program(CARGO_EXECUTABLE cargo)
+if(NOT CARGO_EXECUTABLE)
+  message(FATAL_ERROR "Rust Cargo was not found. Install Rust and ensure cargo is on PATH.")
+endif()
+
+set(RUST_BACKEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../rust_backend")
+set(RUST_BACKEND_DLL "${RUST_BACKEND_DIR}/target/release/mlrc_accs_backend.dll")
+file(GLOB_RECURSE RUST_BACKEND_SOURCES CONFIGURE_DEPENDS
+  "${RUST_BACKEND_DIR}/src/*.rs"
+)
+add_custom_command(
+  OUTPUT "${RUST_BACKEND_DLL}"
+  COMMAND "${CARGO_EXECUTABLE}" build
+    --manifest-path "${RUST_BACKEND_DIR}/Cargo.toml"
+    --release
+  DEPENDS
+    "${RUST_BACKEND_DIR}/Cargo.toml"
+    "${RUST_BACKEND_DIR}/Cargo.lock"
+    ${RUST_BACKEND_SOURCES}
+  WORKING_DIRECTORY "${RUST_BACKEND_DIR}"
+  COMMENT "Building the Rust Wi-Fi transport"
+  VERBATIM
+)
+add_custom_target(mlrc_accs_backend_build DEPENDS "${RUST_BACKEND_DLL}")
+add_dependencies(${BINARY_NAME} mlrc_accs_backend_build)
+
 
 # === Installation ===
 # Support files are copied into place next to the executable, so that it can
@@ -73,6 +99,8 @@ set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
 set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  COMPONENT Runtime)
+install(FILES "${RUST_BACKEND_DLL}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)
 
 install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"

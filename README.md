@@ -1,23 +1,23 @@
 # MLRC ACCS
 
-This repository contains a Flutter-based prototype for an audio/video (AV) watcher and control terminal designed to manage streaming or mirroring workflows across USB and Wi‑Fi transports. The app presents a desktop-style terminal dashboard with transmission controls, event logs, and a debug inspector panel. The panel can capture the local display on demand and discover opted-in app peers on the local network.
+This repository contains a Flutter-based prototype for screen mirroring over Wi-Fi. The Windows and Android apps can discover one another and send captured still-image frames through the Rust backend. It is not yet a live audio/video streamer; USB transport currently exists only as a standalone Rust option.
 
 ## Project purpose
 
 The codebase is best understood as a UI-oriented prototype for a screen-sharing / remote-display system. It focuses on the operator experience and low-level signal flow modeling rather than a production-ready media stack. The interface exposes controls for:
 
 - toggling between standby, transmit, and receive modes
-- choosing the communication path (USB preferred, Wi‑Fi fallback)
-- observing streaming lifecycle events in a live terminal log
+- selecting an opted-in Wi-Fi peer and starting a transmit or receive session
+- observing transport activity in a live terminal log
 - inspecting real local screen captures and discovered opted-in peers in debug mode
 
 ## Repository layout
 
-- `architecture/ARCHITECTURE.puml` — UML class diagram of the current application, debug utilities, and standalone Rust backend
+- `architecture/ARCHITECTURE.puml` — UML class diagram of the current application, Rust FFI bridge, and transports
 - `architecture/render_plantuml.mjs` — renders a PlantUML file to SVG through the configured `@plantuml/mcp-js` MCP server
 - `screen_mirror/` — the Flutter application source
 - `screen_mirror/packages/` — locally maintained compatibility copies of Android plugins that need Gradle updates
-- `rust_backend/` — the Rust watcher core and USB/Wi-Fi transport implementations
+- `rust_backend/` — the Rust watcher core, C ABI, and USB/Wi-Fi transport implementations
 - `config/` — environment configuration files and setup/test helper scripts
 - `run_app.ps1` — Windows launcher for the app in debug or production mode
 - `run_app.sh` — Linux launcher for the app in debug or production mode
@@ -30,6 +30,7 @@ The codebase is best understood as a UI-oriented prototype for a screen-sharing 
 - JSON-driven environment configuration via `--dart-define-from-file`
 - PowerShell and Bash startup scripts for local execution
 - Rust watcher and USB/Wi-Fi transport core with toolchain setup scripts
+- Dart FFI bridge to the Rust Wi-Fi transport on Windows and Android
 
 ## Application overview
 
@@ -37,8 +38,9 @@ The main application entry is in `screen_mirror/lib/main.dart`. It creates a `Wa
 
 - status cards for operation mode, communication channel, and stream status
 - action buttons to start or stop transmitting or receiving
-- a live event stream console that logs simulated network and display activity
-- an optional debug inspector panel for on-demand local screen capture, LAN peer discovery, and host-side ADB device listing
+- a live event console reporting actual Wi-Fi frame transport activity
+- peer selection and opt-in LAN discovery
+- an optional debug inspector panel for on-demand screen capture and host-side ADB device listing
 
 The app uses compile-time environment variables loaded from JSON config files:
 
@@ -51,7 +53,9 @@ These values are defined in the configuration profiles under `config/` and passe
 
 ## Rust backend
 
-The standalone Rust library lives in `rust_backend/`. It provides mode-checked watcher operations, UDP frame fragmentation/reassembly with sequence tracking and a bounded jitter buffer, and an optional libusb bulk transport. Run its tests with:
+The Rust library in `rust_backend/` is connected to Flutter through a small C ABI and Dart FFI wrapper. It provides mode-checked watcher operations, UDP frame fragmentation/reassembly with sequence tracking and a bounded jitter buffer, and an optional libusb bulk transport. Windows builds compile and bundle the Rust DLL from the Flutter Windows CMake build. Android builds compile armeabi-v7a, arm64-v8a, and x86_64 Rust libraries against the installed NDK before Flutter packages the APK.
+
+Run the backend tests with:
 
 ```powershell
 cd rust_backend
@@ -60,7 +64,19 @@ cargo test
 
 Enable the hardware USB implementation with `cargo test --features usb` (and `cargo build --features usb` for builds). USB requires the peer device to use the configured interface/endpoints and the backend's 4-byte big-endian frame-length prefix. The UDP transport takes encoded frame bytes from its caller; it does not capture or encode video.
 
-The Rust crate is not yet connected to the Flutter controls. Flutter still emits simulated transmit/receive events, and the repository does not yet include a pairing/handshake flow, media capture/encoding/decoding/rendering pipeline, or a generated FFI bridge. The crate provides the transport/core layer for that later integration.
+### Current Wi-Fi transport workflow
+
+1. Launch the app on both devices while they are on the same local network.
+2. Press **Discover** on both devices and select the other device from the **Wi-Fi peer** list.
+3. On the receiving device, press **Start Receiving**.
+4. On the sending device, press **Start Transmitting** and approve Android's screen-capture prompt if requested. The app captures and sends one still image. Use **Capture** in the debug panel to send another image.
+5. The receiving app displays the latest received image and logs its byte count.
+
+Both apps must be discoverable and connected to the same LAN; allow the app through host firewalls if prompted. Discovery advertises a TCP presence port and the Rust UDP socket binds to that same local port. Peer addresses currently use IPv4.
+
+This is a working transport slice, not live screen mirroring: each capture sends a single encoded screenshot frame. Continuous capture, video encoding/decoding, audio, retransmission, encryption, pairing/authentication, and USB device-to-device support are not implemented. UDP is best-effort and currently unencrypted, so use only on a trusted LAN.
+
+The project launchers build the required native Rust library automatically. The Windows CMake build compiles the DLL. For Android, the launcher uses `config/build/build_android_rust.ps1` on Windows or `config/build/build_android_rust.sh` on Linux and requires the Rust Android targets plus the Flutter-selected NDK. Direct Flutter Android commands bypass this preparation step; use `run_app.ps1` / `run_app.sh` or run the platform build script first.
 
 ## Configuration profiles
 
@@ -128,6 +144,36 @@ The command format is:
 run_app [debug|prod] [host|windows|linux|android] [run|build]
 ```
 
+### Create Windows and Android builds
+
+From the repository root, run the Windows commands in PowerShell on a Windows host. The launcher selects the production profile and builds each target in release mode:
+
+```powershell
+.\run_app.ps1 prod windows build
+.\run_app.ps1 prod android build
+```
+
+The Windows app is written under `screen_mirror\build\windows\`; the Android APK is written under `screen_mirror\build\app\outputs\flutter-apk\`. Android builds do not require a connected device. Windows desktop builds must run on Windows and require Visual Studio 2022 with the **Desktop development with C++** workload and C++ ATL. The launcher checks and installs required tooling where possible; see [What setup automates](#what-setup-automates) for details.
+
+On Linux, build the Android APK with:
+
+```bash
+./run_app.sh prod android build
+```
+
+The generated APK currently uses Flutter's debug signing configuration, so it is not ready for store distribution.
+
+If a build reports missing Dart files under the Pub cache (for example `jni.dart` or `desktop_screenshot.dart`), first restore network access to `pub.dev` and `storage.googleapis.com`, then repair the cache and dependencies:
+
+```powershell
+Push-Location .\screen_mirror
+..\config\flutter\bin\flutter.bat pub cache repair
+..\config\flutter\bin\flutter.bat pub get
+Pop-Location
+```
+
+The launch scripts resolve Flutter packages before building so incomplete dependencies fail before the native compiler runs.
+
 Show launcher-specific usage and examples with `.\run_app.ps1 -Help` in PowerShell or `./run_app.sh --help` in Bash. Help exits before checking or installing any tools.
 
 Target defaults to `host` and action defaults to `run`. Windows desktop builds must run on Windows; Linux desktop builds must run on Linux. Android run requires exactly one authorized Android device or running emulator; the launcher checks ADB and explicitly targets that device instead of offering desktop or web targets. Unlock a USB-connected device and accept its USB debugging prompt, or start an emulator in Android Studio Device Manager first. Android builds do not require a connected device and produce an APK under `screen_mirror/build/app/outputs/flutter-apk/`. Production APKs currently use Flutter's debug signing configuration and are not ready for store distribution.
@@ -135,6 +181,7 @@ Target defaults to `host` and action defaults to `run`. Windows desktop builds m
 ### What setup automates
 
 - Flutter stable SDK is installed under `config/flutter/` if no SDK is available.
+- On Windows, the Flutter clone enables Git long-path support for checkout. If setup detects a partial checkout from an earlier path-length failure, remove `config\flutter\` and rerun the setup or launcher.
 - Rust is installed if missing, using the platform scripts in `config/setup/`.
 - Android SDK Platform-Tools (ADB) are checked for Windows and Linux desktop runs and Android targets. If ADB is unavailable, the launcher downloads the official Platform-Tools into `config/adb/` and adds them to the current process's `PATH`.
 - Android builds check the NDK version required by the selected Flutter SDK and install it through the Android CLI or `sdkmanager` if it is missing.
@@ -151,18 +198,19 @@ The setup helpers can also be run directly:
 - `config/setup/setup_rust.ps1` / `config/setup/setup_rust.sh`
 - `config/setup/setup_adb.ps1` / `config/setup/setup_adb.sh`
 - `config/setup/setup_ndk.ps1` / `config/setup/setup_ndk.sh`
+- `config/build/build_android_rust.ps1` / `config/build/build_android_rust.sh` build and package the Android Rust libraries (the Android launchers run these automatically).
 
 The `config/test/test_rust.ps1` and `config/test/test_rust.sh` scripts compile and run a small Rust verification program in four parallel instances.
 
 ## Debug panel features and limits
 
-The debug panel uses real OS capture and device discovery APIs, but these features are separate from the prototype's simulated AV transmit/receive controls:
+The debug panel uses real OS capture and device discovery APIs:
 
-- **Screen capture:** click **Capture** to request a single current-screen preview. Windows and Linux use the desktop screenshot API. Android invokes the OS screen-capture consent flow, briefly records to the app-private cache, extracts one frame, and deletes the temporary recording. The preview is kept in app memory only and is discarded when replaced or when the app exits. Android requires the user to approve the system prompt for each capture session; audio capture is not enabled.
-- **Wi-Fi discovery:** click **Discover** to advertise this app and discover other MLRC instances on the same LAN using mDNS service type `_mlrc-accs._tcp`. Discovery is opt-in and limited to peers advertising that service; it does not sweep the subnet or identify arbitrary devices. The app advertises a small TCP presence endpoint that returns `MLRC-ACCS/1`; it does not carry screen frames.
+- **Screen capture:** click **Capture** to request a single current-screen preview. Windows and Linux use the desktop screenshot API. Android invokes the OS screen-capture consent flow, briefly records to the app-private cache, extracts one frame, and deletes the temporary recording. The preview is kept in app memory only and is discarded when replaced or when the app exits. While transmitting, each captured frame is sent to the selected peer. Android requires the user to approve the system prompt for each capture session; audio capture is not enabled.
+- **Wi-Fi discovery:** click **Discover** to advertise this app and discover other MLRC instances on the same LAN using mDNS service type `_mlrc-accs._tcp`. Discovery is opt-in and limited to peers advertising that service; it does not sweep the subnet or identify arbitrary devices. The app advertises a small TCP presence endpoint that returns `MLRC-ACCS/1`; Rust binds a UDP socket to the advertised port for frame transport.
 - **USB discovery:** on Windows and Linux hosts, **Discover** runs `adb devices -l` and shows ADB-reported devices, including their authorization state. The desktop launchers set up Platform-Tools if needed. Connect the device, enable USB debugging, and authorize the host on the device. An Android app cannot run host-side ADB to enumerate its own USB connection.
 
-Discovery requires devices to be on the same network with multicast/mDNS allowed. For Android, local network access is declared in the manifest. The same application must be running with discovery active on another device for that device to appear. Discovery does not configure or establish the Rust transport connection.
+Discovery requires devices to be on the same network with multicast/mDNS allowed. For Android, local network access is declared in the manifest. The same application must be running with discovery active on another device for that device to appear. After selecting a peer, start **Receive** on one device and **Transmit** on the other to open the Rust transport.
 
 Android screen capture support raises the app's minimum Android SDK level to API 23 (Android 6.0).
 
@@ -170,9 +218,7 @@ The Android Gradle scripts for `flutter_screen_recording` and `video_thumbnail` 
 
 ## Important implementation note
 
-The project is not yet an end-to-end media streaming system. The Rust crate implements UDP and optional USB bulk transport for caller-supplied frame bytes, but Flutter's transmit/receive workflow is still simulated and is not wired to the crate. There is no platform capture/codec/render pipeline, pairing/authentication flow, or remote screen streaming implementation in this repository.
-
-This means the project is not yet an end-to-end deployed stream service.
+The Flutter app now invokes the Rust UDP transport over FFI on Windows and Android, and a still-image frame can be sent between discovered peers. This is not yet a live or production-ready media streaming system: there is no continuous video capture, video codec pipeline, audio, pairing/authentication, encryption, or USB device-to-device support. UDP does not guarantee delivery, and the current frame protocol is intended only for trusted local networks.
 
 ## Testing status
 
@@ -180,4 +226,4 @@ The project includes a starter widget test in `screen_mirror/test/widget_test.da
 
 ## Summary
 
-`MLRC ACCS` is a compact Flutter prototype for a USB/Wi‑Fi AV control interface. It combines a dark terminal-style dashboard, environmental configuration profiles, and helper scripts for setup and launch, making it a useful demonstration project for future development of a real distributed streaming or mirroring application.
+`MLRC ACCS` is a compact Flutter prototype for a Wi-Fi still-frame mirroring workflow with a Rust transport backend. It combines a dark terminal-style dashboard, environmental configuration profiles, peer discovery, and helper scripts for setup and launch.

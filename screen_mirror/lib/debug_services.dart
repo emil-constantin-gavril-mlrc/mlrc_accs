@@ -140,6 +140,14 @@ class LocalPeerDiscovery {
   bool _discoveryStarted = false;
   final String _instanceId = '$pid-${DateTime.now().microsecondsSinceEpoch}';
 
+  int get port {
+    final server = _server;
+    if (server == null) {
+      throw StateError('Peer discovery has not started.');
+    }
+    return server.port;
+  }
+
   Future<void> start() async {
     await stop();
     _nodes.clear();
@@ -221,9 +229,17 @@ class LocalPeerDiscovery {
         return;
       }
       final addresses = service.hostAddresses;
+      String? ipv4Address;
+      for (final address in addresses) {
+        final parsedAddress = InternetAddress.tryParse(address);
+        if (parsedAddress?.type == InternetAddressType.IPv4) {
+          ipv4Address = parsedAddress!.address;
+          break;
+        }
+      }
       _nodes[service.name] = DiscoveredNode(
         id: service.name,
-        address: addresses.isEmpty ? 'Address unavailable' : addresses.first,
+        address: ipv4Address ?? 'IPv4 address unavailable',
         transport: 'Wi-Fi (mDNS)',
         port: service.port,
       );

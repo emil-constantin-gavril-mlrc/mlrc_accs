@@ -12,3 +12,6 @@
 *.tif
 *.tiff
 *.webp
+/screen_mirror/android/app/src/main/jniLibs/
+/rust_backend/target/
+/config/build/

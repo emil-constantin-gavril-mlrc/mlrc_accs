@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 
 import 'debug_services.dart';
 import 'screen_capture_service.dart';
+import 'rust_transport.dart';
 
 void main() {
   runApp(const WatcherTerminalApp());
@@ -56,12 +57,11 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
 
   bool _isStreaming = false;
   late String _activeMode;
-  final String _commType = 'Auto (USB preferred)';
-
-  StreamSubscription? _eventSubscription;
   bool _initialized = false;
   final ScreenCaptureService _screenCaptureService = ScreenCaptureService();
   late final LocalPeerDiscovery _peerDiscovery;
+  RustTransport? _rustTransport;
+  Timer? _receivePollTimer;
   bool _isCapturing = false;
   bool _isDiscovering = false;
   Uint8List? _screenshot;
@@ -69,6 +69,9 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   List<AdbDevice> _adbDevices = [];
   int _screencapCount = 0;
   String _lastScreencapTime = 'Never';
+  String? _selectedPeerId;
+
+  String get _commType => _isStreaming ? 'Wi-Fi (Rust UDP)' : 'Wi-Fi';
 
   @override
   void initState() {
@@ -77,7 +80,12 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     _peerDiscovery = LocalPeerDiscovery(
       onNodesChanged: (nodes) {
         if (mounted) {
-          setState(() => _networkNodes = nodes);
+          setState(() {
+            _networkNodes = nodes;
+            if (!nodes.any((node) => node.id == _selectedPeerId)) {
+              _selectedPeerId = nodes.isEmpty ? null : nodes.first.id;
+            }
+          });
         }
       },
       onError: (error) {
@@ -106,7 +114,8 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
 
   @override
   void dispose() {
-    _eventSubscription?.cancel();
+    _receivePollTimer?.cancel();
+    _rustTransport?.stop();
     unawaited(_peerDiscovery.stop());
     _scrollController.dispose();
     super.dispose();
@@ -131,6 +140,14 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       _logEvent(
         '[Capture] Screen captured in memory (#$_screencapCount); temporary capture data was removed.',
       );
+      if (_isStreaming && _activeMode == 'Transmit') {
+        try {
+          _rustTransport!.sendFrame(image);
+          _logEvent('[Network] Queued $_screencapCount frame for Rust UDP.');
+        } catch (error) {
+          _logEvent('[Network error] Could not queue frame: $error');
+        }
+      }
     } catch (error) {
       if (mounted) {
         _logEvent('[Capture error] $error');
@@ -214,46 +231,107 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     });
   }
 
-  void _toggleWatcher(String mode) {
+  Future<void> _toggleWatcher(String mode) async {
     if (_isStreaming && _activeMode == mode) {
-      _eventSubscription?.cancel();
+      _stopWatcher();
+      return;
+    }
+    if (_isStreaming) {
+      _stopWatcher();
+    }
+
+    if (!_isDiscovering) {
+      await _toggleDeviceDiscovery();
+      if (_isDiscovering) {
+        _logEvent(
+          '[Network] Discovery started. Select the other device, then start again.',
+        );
+      }
+      return;
+    }
+
+    DiscoveredNode? peer;
+    for (final node in _networkNodes) {
+      if (node.id == _selectedPeerId) {
+        peer = node;
+        break;
+      }
+    }
+    if (peer == null) {
+      _logEvent('[Network error] Select a discovered peer before connecting.');
+      return;
+    }
+    if (peer.address == 'IPv4 address unavailable') {
+      _logEvent(
+        '[Network error] The selected peer did not advertise an IPv4 address.',
+      );
+      return;
+    }
+
+    try {
+      final transport = RustTransport();
+      transport.start(
+        transmitting: mode == 'Transmit',
+        localPort: _peerDiscovery.port,
+        peerAddress: peer.address,
+        peerPort: peer.port,
+      );
       setState(() {
-        _isStreaming = false;
-        _activeMode = 'Standby';
-      });
-      _logEvent('Watcher stopped.');
-    } else {
-      _eventSubscription?.cancel();
-      setState(() {
+        _rustTransport = transport;
         _isStreaming = true;
         _activeMode = mode;
       });
-      _logEvent('Watcher started in mode: $mode');
-      _simulateWatcherEvents();
+      _logEvent(
+        '[Network] Rust UDP $mode session started with ${peer.address}:${peer.port}.',
+      );
+      _receivePollTimer = Timer.periodic(
+        const Duration(milliseconds: 40),
+        (_) => _pollReceivedFrame(transport),
+      );
+
+      if (mode == 'Transmit') {
+        await _captureScreen();
+      }
+    } catch (error) {
+      if (mounted) {
+        _stopWatcher();
+        _logEvent('[Network error] Could not start $mode: $error');
+      }
     }
   }
 
-  void _simulateWatcherEvents() {
-    _eventSubscription = Stream.periodic(const Duration(seconds: 2), (_) {})
-        .listen((_) {
-          if (!_isStreaming) return;
+  void _stopWatcher() {
+    _receivePollTimer?.cancel();
+    _receivePollTimer = null;
+    _rustTransport?.stop();
+    _rustTransport = null;
+    if (!mounted) return;
+    setState(() {
+      _isStreaming = false;
+      _activeMode = 'Standby';
+    });
+    _logEvent('Watcher stopped.');
+  }
 
-          if (_activeMode == 'Transmit') {
-            _logEvent(
-              '[Network] USB bulk endpoint active. Transmitting video frame chunk...',
-            );
-            _logEvent(
-              '[Display HAL] Captured frame from capture source successfully.',
-            );
-          } else {
-            _logEvent(
-              '[Network] Polling fallback Wi-Fi socket (UDP)... Packet received.',
-            );
-            _logEvent(
-              '[Display HAL] Rendered incoming frame buffer to display surface.',
-            );
-          }
-        });
+  void _pollReceivedFrame(RustTransport transport) {
+    try {
+      final frame = transport.pollFrame();
+      if (frame == null || !mounted) return;
+      setState(() {
+        _screenshot = frame;
+        _screencapCount++;
+        _lastScreencapTime = DateTime.now().toLocal().toString().substring(
+          11,
+          19,
+        );
+      });
+      _logEvent(
+        '[Network] Received frame (${frame.length} bytes) over Rust UDP.',
+      );
+    } catch (error) {
+      _stopWatcher();
+      _logEvent('[Network error] Receiving frame failed: $error');
+    }
   }
 
   @override
@@ -299,7 +377,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                           _buildStatusCard(
                             'Comm Channel',
                             _commType,
-                            Icons.usb,
+                            Icons.wifi,
                           ),
                           const SizedBox(width: 12),
                           _buildStatusCard(
@@ -315,6 +393,64 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                         ],
                       ),
                       const SizedBox(height: 16),
+
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text(
+                              'Wi-Fi peer',
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                          TextButton.icon(
+                            onPressed: _isStreaming
+                                ? null
+                                : _toggleDeviceDiscovery,
+                            icon: Icon(
+                              _isDiscovering ? Icons.stop : Icons.search,
+                              size: 16,
+                            ),
+                            label: Text(
+                              _isDiscovering ? 'Stop discovery' : 'Discover',
+                            ),
+                          ),
+                        ],
+                      ),
+                      if (_networkNodes.isEmpty)
+                        const Text(
+                          'Start discovery on both devices, then select the peer here.',
+                          style: TextStyle(color: Colors.white60, fontSize: 12),
+                        )
+                      else
+                        DropdownButtonFormField<String>(
+                          key: ValueKey(_selectedPeerId),
+                          initialValue: _selectedPeerId,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                          ),
+                          hint: const Text('Select a discovered peer'),
+                          items: _networkNodes
+                              .map(
+                                (node) => DropdownMenuItem(
+                                  value: node.id,
+                                  child: Text(
+                                    '${node.id} (${node.address}:${node.port})',
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: _isStreaming
+                              ? null
+                              : (peerId) =>
+                                    setState(() => _selectedPeerId = peerId),
+                        ),
+                      const Text(
+                        'This prototype sends one still frame per capture; it does not stream live video.',
+                        style: TextStyle(color: Colors.white60, fontSize: 11),
+                      ),
+                      const SizedBox(height: 12),
 
                       // Action Buttons
                       Row(
@@ -371,6 +507,27 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                         ],
                       ),
                       const SizedBox(height: 20),
+
+                      if (_screenshot != null) ...[
+                        Text(
+                          'Last frame (#$_screencapCount, $_lastScreencapTime)',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: compact ? 100 : 150,
+                          child: Center(
+                            child: Image.memory(
+                              _screenshot!,
+                              fit: BoxFit.contain,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
 
                       // Terminal Console Header
                       Row(

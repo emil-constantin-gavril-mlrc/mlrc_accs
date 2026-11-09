@@ -15,16 +15,17 @@ package "Flutter application (screen_mirror)" {
     - _isStreaming: bool
     - _commType: String
     - _logs: List<String>
-    + _toggleWatcher(mode): void
-    + _simulateWatcherEvents(): void
+    + _toggleWatcher(mode): Future<void>
     + _captureScreen(): Future<void>
     + _toggleDeviceDiscovery(): Future<void>
+    - _pollReceivedFrame(transport): void
   }
   class ScreenCaptureService {
     + captureCurrentScreen(): Future<Uint8List>
     - _captureAndroidScreen(): Future<Uint8List>
   }
   class LocalPeerDiscovery {
+    + port: int
     + start(): Future<void>
     + stop(): Future<void>
     - _handleDiscoveryEvent(event): void
@@ -36,14 +37,21 @@ package "Flutter application (screen_mirror)" {
   }
   class DiscoveredNode
   class AdbDevice
-  class "Stream.periodic simulator" as EventSimulator
   class "TCP presence ServerSocket" as PresenceServer
+  class RustTransport {
+    + start(mode, localPort, peerAddress, peerPort): void
+    + sendFrame(frame): void
+    + pollFrame(): Uint8List?
+    + stop(): void
+  }
 }
 
 class Operator <<actor>>
 
 package "Launch and environment configuration" {
   class "run_app.ps1 / run_app.sh" as Launcher <<script>>
+  class "build_android_rust.ps1 / .sh" as AndroidRustBuild <<script>>
+  class "Windows CMake Cargo target" as WindowsRustBuild <<build>>
   class "config_debug.json / config_production.json" as ConfigProfiles <<JSON>>
 }
 
@@ -57,7 +65,13 @@ package "Flutter plugins and host APIs" {
   class "Windows / Linux / Android display" as DisplayApi <<platform>>
 }
 
-package "Rust backend crate (standalone)" {
+package "Rust backend crate" {
+  class "C ABI" as RustFfi {
+    + mlrc_watcher_start(...): i32
+    + mlrc_watcher_send(...): i32
+    + mlrc_watcher_poll(...): i32
+    + mlrc_watcher_stop(...): void
+  }
   class Watcher {
     - mode: OperationMode
     - transport: Box<dyn Transport>
@@ -115,10 +129,12 @@ package "Remote transport peers" {
 Operator --> WatcherTerminalApp
 WatcherTerminalApp --> TerminalDashboard : home
 TerminalDashboard *-- DashboardState
-DashboardState --> EventSimulator : start / stop\n(simulated events only)
-DashboardState --> ScreenCaptureService : user-requested preview
+DashboardState --> RustTransport : start / send / poll / stop
+DashboardState --> ScreenCaptureService : capture frame
 DashboardState --> LocalPeerDiscovery : opt-in discovery
 DashboardState ..> AdbDiscovery : desktop host discovery
+RustTransport ..> RustFfi : Dart FFI
+RustFfi --> Watcher
 
 ScreenCaptureService ..> DesktopScreenshot : Windows / Linux capture
 ScreenCaptureService ..> ScreenRecording : brief Android recording
@@ -126,7 +142,7 @@ ScreenRecording ..> DisplayApi : Android capture authorization
 ScreenCaptureService ..> VideoThumbnail : extract one preview frame
 ScreenCaptureService ..> PathProvider : temporary cache path
 
-LocalPeerDiscovery *-- PresenceServer : binds random TCP port
+LocalPeerDiscovery *-- PresenceServer : binds TCP port
 LocalPeerDiscovery ..> Bonsoir : advertise / discover\n_mlrc-accs._tcp
 LocalPeerDiscovery --> DiscoveredNode : publishes resolved peers
 PresenceServer --> PresenceClient : "MLRC-ACCS/1" presence line
@@ -136,6 +152,9 @@ AdbCli --> AndroidDevice
 
 Launcher --> ConfigProfiles : selects profile
 Launcher --> WatcherTerminalApp : --dart-define-from-file
+Launcher --> AndroidRustBuild : Android target
+AndroidRustBuild --> RustFfi : armeabi-v7a / arm64-v8a / x86_64 .so
+WindowsRustBuild --> RustFfi : Windows DLL
 
 WatcherConfig ..> Watcher : constructor input
 Watcher *-- Transport : selects one transport
@@ -151,20 +170,20 @@ UdpTransport --> UdpPeer : UDP frame chunks
 UsbBulkTransport --> UsbPeer : length-prefixed bulk frames
 
 note right of DashboardState
-  Streaming buttons only update UI state and emit
-  periodic sample log messages. They do not capture,
-  encode, send, receive, decode, or render video.
+  Transmit captures and sends one still frame per
+  start or explicit debug capture. Receive displays
+  the latest received frame; no live video pipeline.
 end note
 
 note bottom of LocalPeerDiscovery
-  Discovery advertises a presence endpoint; it does not
-  configure or establish either Rust transport.
+  The advertised port is also bound by the local Rust
+  UDP transport. Discovered IPv4 address and service
+  port configure the remote UDP peer.
 end note
 
 note bottom of Watcher
-  There is currently no Flutter-to-Rust FFI, process
-  bridge, or transport call. The Rust crate accepts
-  caller-supplied opaque frame bytes.
+  The C ABI worker owns the Watcher and exposes a
+  bounded outgoing queue plus a polled incoming queue.
 end note
 
 note right of UdpTransport

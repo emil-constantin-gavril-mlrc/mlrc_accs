@@ -170,6 +170,11 @@ if ($Target -eq "android") {
     }
 
     & (Join-Path $SetupDir "setup_ndk.ps1") -AndroidSdk $AndroidSdk -NdkVersion $NdkVersion
+    & (Join-Path $RepoRoot "config\build\build_android_rust.ps1") `
+        -NdkDirectory (Join-Path $AndroidSdk "ndk\$NdkVersion")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Rust Android library build failed with exit code $LASTEXITCODE."
+    }
 
     if ($Action -eq "run") {
         $AdbDevicesOutput = & adb devices -l
@@ -282,6 +287,12 @@ Write-Host "Using config: $ConfigPath" -ForegroundColor Yellow
 
 Push-Location $ProjectRoot
 try {
+    Write-Host "=== Resolving Flutter packages ===" -ForegroundColor Cyan
+    & $FlutterCommand pub get
+    if ($LASTEXITCODE -ne 0) {
+        throw "Flutter dependency resolution failed with exit code $LASTEXITCODE. Check network access and repair the Pub cache with 'flutter pub cache repair', then retry."
+    }
+
     & $FlutterCommand @FlutterArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Flutter $Action failed with exit code $LASTEXITCODE."

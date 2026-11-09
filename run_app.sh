@@ -189,6 +189,7 @@ if [[ "$TARGET" == "android" ]]; then
     echo "Accepting Android SDK licenses. Review and accept the prompts to continue."
     "$FLUTTER_COMMAND" doctor --android-licenses
     bash "$SETUP_DIR/setup_ndk.sh" "$ANDROID_SDK" "$NDK_VERSION"
+    bash "$PROJECT_ROOT/config/build/build_android_rust.sh" "$ANDROID_SDK/ndk/$NDK_VERSION"
 
     if [[ "$ACTION" == "run" ]]; then
         ADB_DEVICES_OUTPUT="$(adb devices -l)" || {
@@ -253,4 +254,6 @@ FLUTTER_ARGS+=("--dart-define-from-file=$CONFIG_PATH")
 echo "=== $ACTION Flutter app ($CONFIG_TYPE, $TARGET) ==="
 echo "Using config: $CONFIG_FILE"
 cd "$PROJECT_DIR"
+echo "=== Resolving Flutter packages ==="
+"$FLUTTER_COMMAND" pub get
 "$FLUTTER_COMMAND" "${FLUTTER_ARGS[@]}"

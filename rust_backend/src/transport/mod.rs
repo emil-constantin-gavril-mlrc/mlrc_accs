@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::BackendError;
 
-pub trait Transport {
+pub trait Transport: Send {
     fn communication_type(&self) -> crate::CommType;
     fn send(&mut self, frame: &[u8]) -> Result<(), BackendError>;
     fn receive(&mut self) -> Result<Vec<u8>, BackendError>;

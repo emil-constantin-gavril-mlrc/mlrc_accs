@@ -1,3 +1,4 @@
+mod ffi;
 pub mod transport;
 
 use std::error::Error;

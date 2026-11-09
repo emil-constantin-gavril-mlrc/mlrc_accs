@@ -9,6 +9,7 @@ license = "MIT"
 [lib]
 name = "mlrc_accs_backend"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = []

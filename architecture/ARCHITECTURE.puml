@@ -1,0 +1,181 @@
+@startuml MLRC-ACCS-ARCHITECTURE
+title MLRC ACCS — current implementation architecture
+left to right direction
+skinparam packageStyle rectangle
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam linetype ortho
+skinparam wrapWidth 190
+
+package "Flutter application (screen_mirror)" {
+  class WatcherTerminalApp <<StatelessWidget>>
+  class TerminalDashboard <<StatefulWidget>>
+  class "_TerminalDashboardState" as DashboardState <<State>> {
+    - _activeMode: String
+    - _isStreaming: bool
+    - _commType: String
+    - _logs: List<String>
+    + _toggleWatcher(mode): void
+    + _simulateWatcherEvents(): void
+    + _captureScreen(): Future<void>
+    + _toggleDeviceDiscovery(): Future<void>
+  }
+  class ScreenCaptureService {
+    + captureCurrentScreen(): Future<Uint8List>
+    - _captureAndroidScreen(): Future<Uint8List>
+  }
+  class LocalPeerDiscovery {
+    + start(): Future<void>
+    + stop(): Future<void>
+    - _handleDiscoveryEvent(event): void
+    - _resolveService(service): Future<void>
+  }
+  class "ADB discovery helpers" as AdbDiscovery {
+    + findAdbDevices(): Future<List<AdbDevice>>
+    + parseAdbDevices(output): List<AdbDevice>
+  }
+  class DiscoveredNode
+  class AdbDevice
+  class "Stream.periodic simulator" as EventSimulator
+  class "TCP presence ServerSocket" as PresenceServer
+}
+
+class Operator <<actor>>
+
+package "Launch and environment configuration" {
+  class "run_app.ps1 / run_app.sh" as Launcher <<script>>
+  class "config_debug.json / config_production.json" as ConfigProfiles <<JSON>>
+}
+
+package "Flutter plugins and host APIs" {
+  class "desktop_screenshot" as DesktopScreenshot <<plugin>>
+  class "flutter_screen_recording" as ScreenRecording <<plugin>>
+  class "video_thumbnail" as VideoThumbnail <<plugin>>
+  class "path_provider" as PathProvider <<plugin>>
+  class "Bonsoir mDNS" as Bonsoir <<plugin>>
+  class "ADB Platform-Tools" as AdbCli <<external>>
+  class "Windows / Linux / Android display" as DisplayApi <<platform>>
+}
+
+package "Rust backend crate (standalone)" {
+  class Watcher {
+    - mode: OperationMode
+    - transport: Box<dyn Transport>
+    - fallback_reason: Option<String>
+    + new(config): Result<Watcher, BackendError>
+    + transmit(frame): Result<(), BackendError>
+    + receive(): Result<Vec<u8>, BackendError>
+  }
+  class WatcherConfig {
+    + mode: OperationMode
+    + communication: CommPreference
+    + usb: Option<UsbConfig>
+    + wifi: Option<UdpConfig>
+  }
+  interface Transport {
+    + communication_type(): CommType
+    + send(frame): Result<(), BackendError>
+    + receive(): Result<Vec<u8>, BackendError>
+  }
+  class UdpTransport {
+    - socket: UdpSocket
+    - incomplete: frame assemblies
+    - ready: jitter buffer
+  }
+  class UsbBulkTransport <<usb feature>> {
+    - handle: libusb DeviceHandle
+    - endpoints: IN / OUT
+  }
+  class UdpConfig
+  class UsbConfig
+  enum OperationMode {
+    Transmit
+    Receive
+  }
+  enum CommPreference {
+    Auto
+    Usb
+    Wifi
+  }
+  enum CommType {
+    Usb
+    Wifi
+  }
+  class BackendError
+}
+
+package "Remote transport peers" {
+  class "mDNS peer" as MdnsPeer <<external>>
+  class "TCP presence client" as PresenceClient <<external>>
+  class "ADB-visible Android device" as AndroidDevice <<external>>
+  class "UDP transport peer" as UdpPeer <<external>>
+  class "USB bulk peer" as UsbPeer <<external>>
+}
+
+Operator --> WatcherTerminalApp
+WatcherTerminalApp --> TerminalDashboard : home
+TerminalDashboard *-- DashboardState
+DashboardState --> EventSimulator : start / stop\n(simulated events only)
+DashboardState --> ScreenCaptureService : user-requested preview
+DashboardState --> LocalPeerDiscovery : opt-in discovery
+DashboardState ..> AdbDiscovery : desktop host discovery
+
+ScreenCaptureService ..> DesktopScreenshot : Windows / Linux capture
+ScreenCaptureService ..> ScreenRecording : brief Android recording
+ScreenRecording ..> DisplayApi : Android capture authorization
+ScreenCaptureService ..> VideoThumbnail : extract one preview frame
+ScreenCaptureService ..> PathProvider : temporary cache path
+
+LocalPeerDiscovery *-- PresenceServer : binds random TCP port
+LocalPeerDiscovery ..> Bonsoir : advertise / discover\n_mlrc-accs._tcp
+LocalPeerDiscovery --> DiscoveredNode : publishes resolved peers
+PresenceServer --> PresenceClient : "MLRC-ACCS/1" presence line
+AdbDiscovery --> AdbCli : devices -l
+AdbDiscovery --> AdbDevice : parses device list
+AdbCli --> AndroidDevice
+
+Launcher --> ConfigProfiles : selects profile
+Launcher --> WatcherTerminalApp : --dart-define-from-file
+
+WatcherConfig ..> Watcher : constructor input
+Watcher *-- Transport : selects one transport
+UdpTransport ..|> Transport
+UsbBulkTransport ..|> Transport
+UdpTransport *-- UdpConfig
+UsbBulkTransport ..> UsbConfig : configured at open
+Watcher ..> OperationMode
+Watcher ..> CommPreference
+Transport ..> CommType
+Transport ..> BackendError
+UdpTransport --> UdpPeer : UDP frame chunks
+UsbBulkTransport --> UsbPeer : length-prefixed bulk frames
+
+note right of DashboardState
+  Streaming buttons only update UI state and emit
+  periodic sample log messages. They do not capture,
+  encode, send, receive, decode, or render video.
+end note
+
+note bottom of LocalPeerDiscovery
+  Discovery advertises a presence endpoint; it does not
+  configure or establish either Rust transport.
+end note
+
+note bottom of Watcher
+  There is currently no Flutter-to-Rust FFI, process
+  bridge, or transport call. The Rust crate accepts
+  caller-supplied opaque frame bytes.
+end note
+
+note right of UdpTransport
+  12-byte MAC1 / sequence / chunk-index / chunk-count
+  header; bounded reassembly and jitter buffer.
+  Best-effort UDP; no retransmission.
+end note
+
+note right of UsbBulkTransport
+  Optional Cargo feature "usb". Uses configured device
+  IDs, interface and endpoints; no peer firmware or
+  device/endpoint discovery is included.
+end note
+@enduml

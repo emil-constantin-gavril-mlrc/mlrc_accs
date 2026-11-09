@@ -13,8 +13,11 @@ The codebase is best understood as a UI-oriented prototype for a screen-sharing 
 
 ## Repository layout
 
+- `architecture/ARCHITECTURE.puml` — UML class diagram of the current application, debug utilities, and standalone Rust backend
+- `architecture/render_plantuml.mjs` — renders a PlantUML file to SVG through the configured `@plantuml/mcp-js` MCP server
 - `screen_mirror/` — the Flutter application source
 - `screen_mirror/packages/` — locally maintained compatibility copies of Android plugins that need Gradle updates
+- `rust_backend/` — the Rust watcher core and USB/Wi-Fi transport implementations
 - `config/` — environment configuration files and setup/test helper scripts
 - `run_app.ps1` — Windows launcher for the app in debug or production mode
 - `run_app.sh` — Linux launcher for the app in debug or production mode
@@ -26,7 +29,7 @@ The codebase is best understood as a UI-oriented prototype for a screen-sharing 
 - Material Design UI components
 - JSON-driven environment configuration via `--dart-define-from-file`
 - PowerShell and Bash startup scripts for local execution
-- Rust toolchain setup and verification scripts
+- Rust watcher and USB/Wi-Fi transport core with toolchain setup scripts
 
 ## Application overview
 
@@ -45,6 +48,19 @@ The app uses compile-time environment variables loaded from JSON config files:
 - `ENVIRONMENT`
 
 These values are defined in the configuration profiles under `config/` and passed into the Flutter app at runtime.
+
+## Rust backend
+
+The standalone Rust library lives in `rust_backend/`. It provides mode-checked watcher operations, UDP frame fragmentation/reassembly with sequence tracking and a bounded jitter buffer, and an optional libusb bulk transport. Run its tests with:
+
+```powershell
+cd rust_backend
+cargo test
+```
+
+Enable the hardware USB implementation with `cargo test --features usb` (and `cargo build --features usb` for builds). USB requires the peer device to use the configured interface/endpoints and the backend's 4-byte big-endian frame-length prefix. The UDP transport takes encoded frame bytes from its caller; it does not capture or encode video.
+
+The Rust crate is not yet connected to the Flutter controls. Flutter still emits simulated transmit/receive events, and the repository does not yet include a pairing/handshake flow, media capture/encoding/decoding/rendering pipeline, or a generated FFI bridge. The crate provides the transport/core layer for that later integration.
 
 ## Configuration profiles
 
@@ -67,6 +83,20 @@ Example debug profile:
 The runtime startup scripts load the selected config and invoke Flutter with `--dart-define-from-file`.
 
 ## Setup, build, and run
+
+### Render the architecture diagram
+
+With Node.js and npm available, run this from the repository root:
+
+```powershell
+node .\architecture\render_plantuml.mjs
+```
+
+The script starts the same `npx -y @plantuml/mcp-js` server configured in `.mcp.json`, calls its `render_diagram` tool, and writes `architecture/ARCHITECTURE.svg`. Optional arguments specify a different input and output:
+
+```powershell
+node .\architecture\render_plantuml.mjs .\architecture\ARCHITECTURE.puml .\architecture\output.svg
+```
 
 The launchers are the one-stop developer entrypoints. They check for Flutter and Rust, run the matching setup scripts if either is missing, select an environment profile, and build or run for a supported target. The Flutter SDK installed by the setup script is kept in `config/flutter/`.
 
@@ -132,7 +162,7 @@ The debug panel uses real OS capture and device discovery APIs, but these featur
 - **Wi-Fi discovery:** click **Discover** to advertise this app and discover other MLRC instances on the same LAN using mDNS service type `_mlrc-accs._tcp`. Discovery is opt-in and limited to peers advertising that service; it does not sweep the subnet or identify arbitrary devices. The app advertises a small TCP presence endpoint that returns `MLRC-ACCS/1`; it does not carry screen frames.
 - **USB discovery:** on Windows and Linux hosts, **Discover** runs `adb devices -l` and shows ADB-reported devices, including their authorization state. The desktop launchers set up Platform-Tools if needed. Connect the device, enable USB debugging, and authorize the host on the device. An Android app cannot run host-side ADB to enumerate its own USB connection.
 
-Discovery requires devices to be on the same network with multicast/mDNS allowed. For Android, local network access is declared in the manifest. The same application must be running with discovery active on another device for that device to appear. The prototype's transmit/receive buttons and their event stream remain simulated; discovery does not yet establish a video stream.
+Discovery requires devices to be on the same network with multicast/mDNS allowed. For Android, local network access is declared in the manifest. The same application must be running with discovery active on another device for that device to appear. Discovery does not configure or establish the Rust transport connection.
 
 Android screen capture support raises the app's minimum Android SDK level to API 23 (Android 6.0).
 
@@ -140,7 +170,7 @@ The Android Gradle scripts for `flutter_screen_recording` and `video_thumbnail` 
 
 ## Important implementation note
 
-The current code is a prototype rather than a complete, production-grade media transport system. The debug panel can capture a local screen and discover opted-in peers, but the main AV transmit/receive workflow still generates simulated network and display events. There is no real USB video driver, Wi‑Fi video transport, pairing/authentication flow, or remote screen streaming implementation in this repository.
+The project is not yet an end-to-end media streaming system. The Rust crate implements UDP and optional USB bulk transport for caller-supplied frame bytes, but Flutter's transmit/receive workflow is still simulated and is not wired to the crate. There is no platform capture/codec/render pipeline, pairing/authentication flow, or remote screen streaming implementation in this repository.
 
 This means the project is not yet an end-to-end deployed stream service.
 

@@ -1,0 +1,14 @@
+# Image assets and generated diagrams
+*.avif
+*.bmp
+*.gif
+*.heic
+*.heif
+*.ico
+*.jpeg
+*.jpg
+*.png
+*.svg
+*.tif
+*.tiff
+*.webp

@@ -64,6 +64,9 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   Timer? _receivePollTimer;
   bool _isCapturing = false;
   bool _isDiscovering = false;
+  int _lastLoggedSentBytes = 0;
+  DateTime? _receiveStartedAt;
+  bool _loggedReceiveTimeout = false;
   Uint8List? _screenshot;
   List<DiscoveredNode> _networkNodes = [];
   List<AdbDevice> _adbDevices = [];
@@ -281,12 +284,21 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
         _isStreaming = true;
         _activeMode = mode;
       });
+      _lastLoggedSentBytes = 0;
+      _receiveStartedAt = mode == 'Receive' ? DateTime.now() : null;
+      _loggedReceiveTimeout = false;
       _logEvent(
-        '[Network] Rust UDP $mode session started with ${peer.address}:${peer.port}.',
+        '[Network] Rust UDP $mode session started; local port ${_peerDiscovery.port}, '
+        'peer ${peer.address}:${peer.port}.',
       );
+      if (mode == 'Receive') {
+        _logEvent(
+          '[Network] Listening for Rust UDP frames from ${peer.address}:${peer.port}.',
+        );
+      }
       _receivePollTimer = Timer.periodic(
         const Duration(milliseconds: 40),
-        (_) => _pollReceivedFrame(transport),
+        (_) => _pollTransport(transport, mode, peer!),
       );
 
       if (mode == 'Transmit') {
@@ -305,6 +317,9 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     _receivePollTimer = null;
     _rustTransport?.stop();
     _rustTransport = null;
+    _receiveStartedAt = null;
+    _loggedReceiveTimeout = false;
+    _lastLoggedSentBytes = 0;
     if (!mounted) return;
     setState(() {
       _isStreaming = false;
@@ -313,24 +328,54 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     _logEvent('Watcher stopped.');
   }
 
-  void _pollReceivedFrame(RustTransport transport) {
+  void _pollTransport(
+    RustTransport transport,
+    String mode,
+    DiscoveredNode peer,
+  ) {
     try {
       final frame = transport.pollFrame();
-      if (frame == null || !mounted) return;
-      setState(() {
-        _screenshot = frame;
-        _screencapCount++;
-        _lastScreencapTime = DateTime.now().toLocal().toString().substring(
-          11,
-          19,
+      if (frame != null) {
+        if (!mounted) return;
+        setState(() {
+          _screenshot = frame;
+          _screencapCount++;
+          _lastScreencapTime = DateTime.now().toLocal().toString().substring(
+            11,
+            19,
+          );
+        });
+        _receiveStartedAt = DateTime.now();
+        _loggedReceiveTimeout = false;
+        _logEvent(
+          '[Network] Received frame (${frame.length} bytes) over Rust UDP.',
         );
-      });
-      _logEvent(
-        '[Network] Received frame (${frame.length} bytes) over Rust UDP.',
-      );
+      }
+      if (mode == 'Transmit') {
+        final sentBytes = transport.sentBytes;
+        if (sentBytes > _lastLoggedSentBytes) {
+          final delta = sentBytes - _lastLoggedSentBytes;
+          _lastLoggedSentBytes = sentBytes;
+          _logEvent(
+            '[Network] Rust UDP sent $delta frame bytes to ${peer.address}:${peer.port}; '
+            'UDP does not confirm remote receipt.',
+          );
+        }
+      } else {
+        final startedAt = _receiveStartedAt;
+        if (!_loggedReceiveTimeout &&
+            startedAt != null &&
+            DateTime.now().difference(startedAt) >=
+                const Duration(seconds: 10)) {
+          _loggedReceiveTimeout = true;
+          _logEvent(
+            '[Network warning] No UDP frame received in 10 seconds. Check that the peer is transmitting to this device’s advertised IP/port and that the network/firewall allows UDP.',
+          );
+        }
+      }
     } catch (error) {
       _stopWatcher();
-      _logEvent('[Network error] Receiving frame failed: $error');
+      _logEvent('[Network error] Rust UDP $mode session failed: $error');
     }
   }
 

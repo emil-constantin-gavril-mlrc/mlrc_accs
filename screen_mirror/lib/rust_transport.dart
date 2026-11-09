@@ -55,6 +55,8 @@ typedef _FreeBufferNative = ffi.Void Function(
   ffi.IntPtr,
 );
 typedef _FreeBufferDart = void Function(ffi.Pointer<ffi.Uint8>, int);
+typedef _SentBytesNative = ffi.IntPtr Function(ffi.Pointer<ffi.Void>);
+typedef _SentBytesDart = int Function(ffi.Pointer<ffi.Void>);
 typedef _StopNative = ffi.Void Function(ffi.Pointer<ffi.Void>);
 typedef _StopDart = void Function(ffi.Pointer<ffi.Void>);
 
@@ -72,6 +74,9 @@ class RustTransport {
       _freeBuffer = library.lookupFunction<_FreeBufferNative, _FreeBufferDart>(
         'mlrc_buffer_free',
       ),
+      _sentBytes = library.lookupFunction<_SentBytesNative, _SentBytesDart>(
+        'mlrc_watcher_sent_bytes',
+      ),
       _stop = library.lookupFunction<_StopNative, _StopDart>(
         'mlrc_watcher_stop',
       );
@@ -81,6 +86,7 @@ class RustTransport {
   final _SendDart _send;
   final _PollDart _poll;
   final _FreeBufferDart _freeBuffer;
+  final _SentBytesDart _sentBytes;
   final _StopDart _stop;
   ffi.Pointer<ffi.Void>? _watcher;
 
@@ -184,6 +190,8 @@ class RustTransport {
       calloc.free(output);
     }
   }
+
+  int get sentBytes => _sentBytes(_requireWatcher());
 
   void stop() {
     final watcher = _watcher;

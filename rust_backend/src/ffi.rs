@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -18,6 +18,7 @@ pub struct FfiWatcher {
     outgoing: SyncSender<Vec<u8>>,
     incoming: Receiver<Result<Vec<u8>, String>>,
     stopped: Arc<AtomicBool>,
+    sent_bytes: Arc<AtomicUsize>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -84,6 +85,7 @@ fn run_worker(
     outgoing: Receiver<Vec<u8>>,
     incoming: SyncSender<Result<Vec<u8>, String>>,
     stopped: Arc<AtomicBool>,
+    sent_bytes: Arc<AtomicUsize>,
 ) {
     match mode {
         OperationMode::Transmit => {
@@ -94,6 +96,7 @@ fn run_worker(
                             deliver(&incoming, Err(error.to_string()), &stopped);
                             return;
                         }
+                        sent_bytes.fetch_add(frame.len(), Ordering::Relaxed);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -169,6 +172,8 @@ pub unsafe extern "C" fn mlrc_watcher_start(
     let (incoming_sender, incoming_receiver) = mpsc::sync_channel(4);
     let stopped = Arc::new(AtomicBool::new(false));
     let worker_stopped = Arc::clone(&stopped);
+    let sent_bytes = Arc::new(AtomicUsize::new(0));
+    let worker_sent_bytes = Arc::clone(&sent_bytes);
     let worker = thread::spawn(move || {
         run_worker(
             watcher,
@@ -176,6 +181,7 @@ pub unsafe extern "C" fn mlrc_watcher_start(
             outgoing_receiver,
             incoming_sender,
             worker_stopped,
+            worker_sent_bytes,
         )
     });
 
@@ -183,6 +189,7 @@ pub unsafe extern "C" fn mlrc_watcher_start(
         outgoing: outgoing_sender,
         incoming: incoming_receiver,
         stopped,
+        sent_bytes,
         worker: Some(worker),
     });
     unsafe {
@@ -233,6 +240,14 @@ pub unsafe extern "C" fn mlrc_watcher_send(
             -1
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mlrc_watcher_sent_bytes(watcher: *mut FfiWatcher) -> usize {
+    if watcher.is_null() {
+        return 0;
+    }
+    unsafe { &*watcher }.sent_bytes.load(Ordering::Relaxed)
 }
 
 #[unsafe(no_mangle)]

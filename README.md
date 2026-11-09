@@ -76,7 +76,7 @@ Both apps must be discoverable and connected to the same LAN; allow the app thro
 
 This is a working transport slice, not live screen mirroring: each capture sends a single encoded screenshot frame. Continuous capture, video encoding/decoding, audio, retransmission, encryption, pairing/authentication, and USB device-to-device support are not implemented. UDP is best-effort and currently unencrypted, so use only on a trusted LAN.
 
-The project launchers build the required native Rust library automatically. The Windows CMake build compiles the DLL. For Android, the launcher uses `config/build/build_android_rust.ps1` on Windows or `config/build/build_android_rust.sh` on Linux and requires the Rust Android targets plus the Flutter-selected NDK. Direct Flutter Android commands bypass this preparation step; use `run_app.ps1` / `run_app.sh` or run the platform build script first.
+The project launchers build the required native Rust library automatically. The Windows CMake build compiles the DLL. For Android, the launcher uses `config/build/build_android_rust.ps1` on Windows or `config/build/build_android_rust.sh` on Linux. These scripts use the Flutter-selected NDK, install any missing Rust targets, and package the armeabi-v7a, arm64-v8a, and x86_64 libraries for Android API 23 under `screen_mirror/android/app/src/main/jniLibs/`. Direct Flutter Android commands bypass this preparation step; use `run_app.ps1` / `run_app.sh` or run the platform build script first.
 
 ## Configuration profiles
 

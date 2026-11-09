@@ -6,12 +6,17 @@ use std::time::{Duration, Instant};
 use crate::{BackendError, CommType};
 
 const MAGIC: [u8; 4] = *b"MAC1";
+const ACK_MAGIC: [u8; 4] = *b"MAA1";
 const HEADER_BYTES: usize = 12;
+const ACK_BYTES: usize = 8;
 const MAX_UDP_PAYLOAD: usize = 65_507;
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_INCOMPLETE_FRAMES: usize = 32;
 const INCOMPLETE_FRAME_TTL: Duration = Duration::from_secs(5);
+const MAX_SEND_ATTEMPTS: usize = 3;
+const ACK_TIMEOUT: Duration = Duration::from_millis(500);
+const PACKET_SEND_DELAY: Duration = Duration::from_micros(100);
 
 #[derive(Clone, Debug)]
 pub struct UdpConfig {
@@ -122,24 +127,83 @@ impl UdpTransport {
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
 
-        for chunk_index in 0..chunk_count {
-            let start = usize::from(chunk_index) * self.config.packet_payload_bytes;
-            let end = (start + self.config.packet_payload_bytes).min(frame.len());
-            let chunk = frame.get(start..end).unwrap_or_default();
-            let mut packet = Vec::with_capacity(HEADER_BYTES + chunk.len());
-            packet.extend_from_slice(&MAGIC);
-            packet.extend_from_slice(&frame_id.to_be_bytes());
-            packet.extend_from_slice(&chunk_index.to_be_bytes());
-            packet.extend_from_slice(&chunk_count.to_be_bytes());
-            packet.extend_from_slice(chunk);
+        for _ in 0..MAX_SEND_ATTEMPTS {
+            for chunk_index in 0..chunk_count {
+                let start = usize::from(chunk_index) * self.config.packet_payload_bytes;
+                let end = (start + self.config.packet_payload_bytes).min(frame.len());
+                let chunk = frame.get(start..end).unwrap_or_default();
+                let mut packet = Vec::with_capacity(HEADER_BYTES + chunk.len());
+                packet.extend_from_slice(&MAGIC);
+                packet.extend_from_slice(&frame_id.to_be_bytes());
+                packet.extend_from_slice(&chunk_index.to_be_bytes());
+                packet.extend_from_slice(&chunk_count.to_be_bytes());
+                packet.extend_from_slice(chunk);
 
-            let sent = self.socket.send(&packet)?;
-            if sent != packet.len() {
-                return Err(BackendError::Transport(format!(
-                    "UDP sent {sent} of {} packet bytes",
-                    packet.len()
-                )));
+                let sent = self.socket.send(&packet)?;
+                if sent != packet.len() {
+                    return Err(BackendError::Transport(format!(
+                        "UDP sent {sent} of {} packet bytes",
+                        packet.len()
+                    )));
+                }
+                if chunk_index + 1 < chunk_count {
+                    std::thread::sleep(PACKET_SEND_DELAY);
+                }
             }
+
+            if self.wait_for_ack(frame_id)? {
+                return Ok(());
+            }
+        }
+
+        Err(BackendError::Transport(format!(
+            "UDP frame {frame_id} was not acknowledged after {MAX_SEND_ATTEMPTS} attempts"
+        )))
+    }
+
+    fn wait_for_ack(&self, frame_id: u32) -> Result<bool, BackendError> {
+        let deadline = Instant::now() + ACK_TIMEOUT;
+        let mut packet = [0_u8; MAX_UDP_PAYLOAD];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            self.socket.set_read_timeout(Some(remaining))?;
+            match self.socket.recv(&mut packet) {
+                Ok(bytes)
+                    if bytes == ACK_BYTES
+                        && packet[..4] == ACK_MAGIC
+                        && u32::from_be_bytes(
+                            packet[4..8].try_into().expect("fixed-width slice"),
+                        ) == frame_id =>
+                {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(BackendError::Io(error)),
+            }
+        }
+    }
+
+    fn send_ack(&self, frame_id: u32) -> Result<(), BackendError> {
+        let mut packet = [0_u8; ACK_BYTES];
+        packet[..4].copy_from_slice(&ACK_MAGIC);
+        packet[4..].copy_from_slice(&frame_id.to_be_bytes());
+        let sent = self.socket.send(&packet)?;
+        if sent != packet.len() {
+            return Err(BackendError::Transport(format!(
+                "UDP sent {sent} of {} acknowledgement bytes",
+                packet.len()
+            )));
         }
         Ok(())
     }
@@ -198,7 +262,7 @@ impl UdpTransport {
             .expected_frame_id
             .is_some_and(|expected| is_before(frame_id, expected))
         {
-            return Ok(());
+            return self.send_ack(frame_id);
         }
         if !self.incomplete.contains_key(&frame_id)
             && self.incomplete.len() >= MAX_INCOMPLETE_FRAMES
@@ -263,6 +327,7 @@ impl UdpTransport {
             .is_some_and(|expected| is_before(frame_id, expected))
         {
             self.ready.entry(frame_id).or_insert(frame);
+            self.send_ack(frame_id)?;
         }
         Ok(())
     }
@@ -368,6 +433,7 @@ fn decode_packet(packet: &[u8]) -> Result<Packet<'_>, BackendError> {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::thread;
 
     use super::*;
     use crate::transport::Transport;
@@ -397,8 +463,57 @@ mod tests {
         let mut receiver = UdpTransport::new(receiver_config).unwrap();
         let frame = (0..4096).map(|byte| (byte % 251) as u8).collect::<Vec<_>>();
 
-        sender.send(&frame).unwrap();
-        assert_eq!(receiver.receive().unwrap(), frame);
+        let expected = frame.clone();
+        let sender_thread = thread::spawn(move || sender.send(&frame));
+        assert_eq!(receiver.receive().unwrap(), expected);
+        sender_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sender_retries_when_the_first_frame_acknowledgement_is_lost() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let receiver_address = receiver.local_addr().unwrap();
+        let config = UdpConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            peer_address: receiver_address,
+            packet_payload_bytes: 64,
+            ..UdpConfig::default()
+        };
+        let mut sender = UdpTransport::new(config).unwrap();
+        let sender_address = sender.local_addr().unwrap();
+        let frame = vec![7; 128];
+
+        let receiver_thread = thread::spawn(move || {
+            let mut packet = [0_u8; 128];
+            for attempt in 0..2 {
+                let mut received_chunks = BTreeMap::new();
+                let mut frame_id = None;
+                let mut chunk_count = 0;
+                while received_chunks.len() < 2 {
+                    let (length, source) = receiver.recv_from(&mut packet).unwrap();
+                    let decoded = decode_packet(&packet[..length]).unwrap();
+                    frame_id = Some(decoded.frame_id);
+                    chunk_count = decoded.chunk_count;
+                    received_chunks.insert(decoded.chunk_index, source);
+                }
+                assert_eq!(chunk_count, 2);
+                if attempt == 1 {
+                    let frame_id = frame_id.unwrap();
+                    let mut ack = [0_u8; ACK_BYTES];
+                    ack[..4].copy_from_slice(&ACK_MAGIC);
+                    ack[4..].copy_from_slice(&frame_id.to_be_bytes());
+                    receiver
+                        .send_to(&ack, sender_address)
+                        .expect("send retry acknowledgement");
+                }
+            }
+        });
+
+        sender.send_frame(&frame).unwrap();
+        receiver_thread.join().unwrap();
     }
 
     #[test]

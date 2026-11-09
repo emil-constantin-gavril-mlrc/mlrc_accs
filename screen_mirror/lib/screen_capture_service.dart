@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:desktop_screenshot/desktop_screenshot.dart';
 import 'package:flutter_screen_recording/flutter_screen_recording.dart';
+import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 
@@ -15,7 +16,7 @@ class ScreenCaptureService {
       if (bytes == null || bytes.isEmpty) {
         throw StateError('The desktop capture API returned no image.');
       }
-      return bytes;
+      return _encodeCompactFrame(bytes);
     }
 
     if (Platform.isAndroid) {
@@ -82,5 +83,24 @@ class ScreenCaptureService {
         await temporaryRecording.delete();
       }
     }
+  }
+
+  Uint8List _encodeCompactFrame(Uint8List bytes) {
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) {
+      throw const FormatException(
+        'The desktop capture is not a supported image.',
+      );
+    }
+
+    final resized = decoded.width > 960 || decoded.height > 960
+        ? img.copyResize(
+            decoded,
+            width: decoded.width >= decoded.height ? 960 : null,
+            height: decoded.height > decoded.width ? 960 : null,
+            interpolation: img.Interpolation.average,
+          )
+        : decoded;
+    return img.encodeJpg(resized, quality: 75);
   }
 }

@@ -141,7 +141,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
         );
       });
       _logEvent(
-        '[Capture] Screen captured in memory (#$_screencapCount); temporary capture data was removed.',
+        '[Capture] Screen captured in memory (#$_screencapCount, ${image.length} bytes); temporary capture data was removed.',
       );
       if (_isStreaming && _activeMode == 'Transmit') {
         try {
@@ -352,13 +352,13 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
         );
       }
       if (mode == 'Transmit') {
-        final sentBytes = transport.sentBytes;
-        if (sentBytes > _lastLoggedSentBytes) {
-          final delta = sentBytes - _lastLoggedSentBytes;
-          _lastLoggedSentBytes = sentBytes;
+        final acknowledgedBytes = transport.acknowledgedBytes;
+        if (acknowledgedBytes > _lastLoggedSentBytes) {
+          final delta = acknowledgedBytes - _lastLoggedSentBytes;
+          _lastLoggedSentBytes = acknowledgedBytes;
           _logEvent(
-            '[Network] Rust UDP sent $delta frame bytes to ${peer.address}:${peer.port}; '
-            'UDP does not confirm remote receipt.',
+            '[Network] Peer acknowledged receipt of $delta frame bytes from '
+            '${peer.address}:${peer.port}.',
           );
         }
       } else {
@@ -387,6 +387,8 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
           _showDebugPanel
               ? 'AV Watcher Control Terminal [DEBUG MODE]'
               : 'AV Watcher Control Terminal',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
         ),
         backgroundColor: _showDebugPanel
             ? const Color(0xFF7C2D12)
@@ -400,8 +402,11 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
             final compact = constraints.maxWidth < 900;
             final isAndroid =
                 Theme.of(context).platform == TargetPlatform.android;
+            if (compact) {
+              return _buildCompactDashboard(isAndroid: isAndroid);
+            }
             return Flex(
-              direction: compact ? Axis.vertical : Axis.horizontal,
+              direction: Axis.horizontal,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 // Left Column: Main Dashboard Control & Terminal
@@ -413,27 +418,33 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                       // Status Cards Header
                       Row(
                         children: [
-                          _buildStatusCard(
-                            'Operation Mode',
-                            _activeMode,
-                            Icons.settings_input_component,
+                          Expanded(
+                            child: _buildStatusCard(
+                              'Operation Mode',
+                              _activeMode,
+                              Icons.settings_input_component,
+                            ),
                           ),
                           const SizedBox(width: 12),
-                          _buildStatusCard(
-                            'Comm Channel',
-                            _commType,
-                            Icons.wifi,
+                          Expanded(
+                            child: _buildStatusCard(
+                              'Comm Channel',
+                              _commType,
+                              Icons.wifi,
+                            ),
                           ),
                           const SizedBox(width: 12),
-                          _buildStatusCard(
-                            'Status',
-                            _isStreaming ? 'ACTIVE' : 'IDLE',
-                            _isStreaming
-                                ? Icons.fiber_manual_record
-                                : Icons.pause_circle_outline,
-                            color: _isStreaming
-                                ? Colors.greenAccent
-                                : Colors.orangeAccent,
+                          Expanded(
+                            child: _buildStatusCard(
+                              'Status',
+                              _isStreaming ? 'ACTIVE' : 'IDLE',
+                              _isStreaming
+                                  ? Icons.fiber_manual_record
+                                  : Icons.pause_circle_outline,
+                              color: _isStreaming
+                                  ? Colors.greenAccent
+                                  : Colors.orangeAccent,
+                            ),
                           ),
                         ],
                       ),
@@ -854,6 +865,347 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     );
   }
 
+  Widget _buildCompactDashboard({required bool isAndroid}) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (!constraints.maxWidth.isFinite || constraints.maxWidth <= 8) {
+          return const SizedBox.shrink();
+        }
+        final cardWidth = (constraints.maxWidth - 8) / 2;
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  SizedBox(
+                    width: cardWidth,
+                    child: _buildStatusCard(
+                      'Operation Mode',
+                      _activeMode,
+                      Icons.settings_input_component,
+                    ),
+                  ),
+                  SizedBox(
+                    width: cardWidth,
+                    child: _buildStatusCard(
+                      'Comm Channel',
+                      _commType,
+                      Icons.wifi,
+                    ),
+                  ),
+                  SizedBox(
+                    width: cardWidth,
+                    child: _buildStatusCard(
+                      'Status',
+                      _isStreaming ? 'ACTIVE' : 'IDLE',
+                      _isStreaming
+                          ? Icons.fiber_manual_record
+                          : Icons.pause_circle_outline,
+                      color: _isStreaming
+                          ? Colors.greenAccent
+                          : Colors.orangeAccent,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Wi-Fi peer',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: _isStreaming ? null : _toggleDeviceDiscovery,
+                    icon: Icon(
+                      _isDiscovering ? Icons.stop : Icons.search,
+                      size: 16,
+                    ),
+                    label: Text(_isDiscovering ? 'Stop' : 'Discover'),
+                  ),
+                ],
+              ),
+              if (_networkNodes.isEmpty)
+                const Text(
+                  'Start discovery on both devices, then select the peer here.',
+                  style: TextStyle(color: Colors.white60, fontSize: 12),
+                )
+              else
+                DropdownButtonFormField<String>(
+                  key: ValueKey(_selectedPeerId),
+                  initialValue: _selectedPeerId,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                  ),
+                  hint: const Text('Select a discovered peer'),
+                  items: _networkNodes
+                      .map(
+                        (node) => DropdownMenuItem(
+                          value: node.id,
+                          child: Text(
+                            '${node.id} (${node.address}:${node.port})',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: _isStreaming
+                      ? null
+                      : (peerId) => setState(() => _selectedPeerId = peerId),
+                ),
+              const SizedBox(height: 4),
+              const Text(
+                'Sends one still frame per capture; this is not live video.',
+                style: TextStyle(color: Colors.white60, fontSize: 11),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _toggleWatcher('Transmit'),
+                      icon: Icon(
+                        _isStreaming && _activeMode == 'Transmit'
+                            ? Icons.stop
+                            : Icons.upload,
+                      ),
+                      label: Text(
+                        _isStreaming && _activeMode == 'Transmit'
+                            ? 'Stop Transmitting'
+                            : 'Start Transmitting',
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor:
+                            _isStreaming && _activeMode == 'Transmit'
+                            ? Colors.redAccent
+                            : Colors.blueAccent,
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 8,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _toggleWatcher('Receive'),
+                      icon: Icon(
+                        _isStreaming && _activeMode == 'Receive'
+                            ? Icons.stop
+                            : Icons.download,
+                      ),
+                      label: Text(
+                        _isStreaming && _activeMode == 'Receive'
+                            ? 'Stop Receiving'
+                            : 'Start Receiving',
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor:
+                            _isStreaming && _activeMode == 'Receive'
+                            ? Colors.redAccent
+                            : Colors.teal,
+                        padding: const EdgeInsets.symmetric(
+                          vertical: 12,
+                          horizontal: 8,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              _buildCompactEventLog(),
+              if (_showDebugPanel) ...[
+                const SizedBox(height: 16),
+                _buildCompactInspector(isAndroid: isAndroid),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildCompactEventLog() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            const Expanded(
+              child: Text(
+                'Event Stream Terminal',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+              ),
+            ),
+            TextButton.icon(
+              onPressed: () => setState(() => _logs.clear()),
+              icon: const Icon(Icons.clear_all, size: 16),
+              label: const Text('Clear'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        SizedBox(height: 280, child: _buildLogList()),
+      ],
+    );
+  }
+
+  Widget _buildLogList() {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: ListView.builder(
+        controller: _scrollController,
+        itemCount: _logs.length,
+        itemBuilder: (context, index) {
+          final log = _logs[index];
+          final textColor = log.contains('Network')
+              ? const Color(0xFF38BDF8)
+              : log.contains('Display HAL')
+              ? const Color(0xFF4ADE80)
+              : log.contains('System') || log.contains('Debug')
+              ? const Color(0xFFFACC15)
+              : Colors.white70;
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: Text(
+              log,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 12,
+                color: textColor,
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildCompactInspector({required bool isAndroid}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          'Debug Inspector Panel',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+            color: Colors.amberAccent,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E293B),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'Available MLRC peers',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+              const SizedBox(height: 6),
+              if (_networkNodes.isEmpty && _adbDevices.isEmpty)
+                Text(
+                  _isDiscovering
+                      ? isAndroid
+                            ? 'Searching for peers...'
+                            : 'Searching for peers and USB devices...'
+                      : 'Discovery has not been started.',
+                  style: const TextStyle(fontSize: 12, color: Colors.white60),
+                ),
+              ..._networkNodes.map(
+                (node) => _buildNodeRow(
+                  Icons.wifi,
+                  node.id,
+                  '${node.address}:${node.port}',
+                ),
+              ),
+              ..._adbDevices.map(
+                (device) => _buildNodeRow(
+                  Icons.usb,
+                  device.description,
+                  '${device.serial} (${device.status})',
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        Container(
+          height: 260,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1E293B),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.amber.withValues(alpha: 0.3)),
+          ),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Current screen preview',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  TextButton.icon(
+                    onPressed: _isCapturing ? null : _captureScreen,
+                    icon: const Icon(Icons.camera_alt, size: 16),
+                    label: Text(_isCapturing ? 'Capturing' : 'Capture'),
+                  ),
+                ],
+              ),
+              const Divider(color: Colors.white24),
+              Expanded(
+                child: Center(
+                  child: _screenshot == null
+                      ? const Text(
+                          'Capture starts only when requested.\nPreview stays in memory.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 11, color: Colors.white60),
+                        )
+                      : Image.memory(_screenshot!, fit: BoxFit.contain),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                _screencapCount == 0
+                    ? 'Last capture: Never'
+                    : 'Capture #$_screencapCount at $_lastScreencapTime',
+                style: const TextStyle(fontSize: 11, color: Colors.white60),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildNodeRow(IconData icon, String name, String details) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
@@ -891,39 +1243,41 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     IconData icon, {
     Color color = Colors.white,
   }) {
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1E293B),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: Colors.white10),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(icon, size: 16, color: Colors.white54),
-                const SizedBox(width: 6),
-                Text(
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E293B),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 16, color: Colors.white54),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
                   title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 12, color: Colors.white54),
                 ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              value,
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                color: color,
               ),
-              overflow: TextOverflow.ellipsis,
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+              color: color,
             ),
-          ],
-        ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
       ),
     );
   }

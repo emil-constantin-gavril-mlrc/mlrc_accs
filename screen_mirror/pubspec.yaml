@@ -42,6 +42,7 @@ dependencies:
   path_provider: ^2.1.5
   video_thumbnail:
     path: packages/video_thumbnail
+  image: ^4.12.0
 
 dev_dependencies:
   flutter_test:

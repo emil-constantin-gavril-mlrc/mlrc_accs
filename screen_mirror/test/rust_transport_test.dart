@@ -53,7 +53,7 @@ void main() {
           }
         }
         expect(actual, expected);
-        expect(sender.sentBytes, expected.length);
+        expect(sender.acknowledgedBytes, expected.length);
       } finally {
         sender.stop();
         receiver.stop();

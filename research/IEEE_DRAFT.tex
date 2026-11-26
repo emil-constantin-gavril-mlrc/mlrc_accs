@@ -1,0 +1,416 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{url}
+
+\title{An OS and Transport-Agnostic Communication Layer for Interactive Video Streaming and USB-OTG Control}
+
+\author{
+\IEEEauthorblockN{Gavril Emil-Constantin}
+\IEEEauthorblockA{Technical University of "Gheorghe Asachi"\\
+Iasi, Romania\\
+emil-constantin.gavril@student.tuiasi.ro}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Interactive screen sharing couples latency-sensitive visual media with small,
+time-critical control messages, yet most implementations bind these workloads
+to one operating-system API or assume a continuously available IP network.
+This paper describes the design of an operating-system- and transport-agnostic
+inter-node communication layer for interactive video streaming and USB
+On-The-Go (OTG) control. A shared application framing and session model is
+decoupled from transport adapters for local IP, USB, and a constrained
+Bluetooth fallback. Control prioritization and stale-frame expiry are design
+objectives. We define an evaluation across transport performance, handover
+disruption, control responsiveness, and implementation portability. The current
+prototype supports continuous video streaming and transport fallback across
+its implemented transports. Context-dependent automatic selection based on
+inter-node payload remains future work. This draft reports no measured
+performance results; the evaluation tables identify measurements for the
+existing fallback and the proposed payload-aware selection.
+\end{abstract}
+
+\begin{IEEEkeywords}
+heterogeneous transports, screen streaming, USB OTG, graceful degradation,
+cross-platform systems, transport handover
+\end{IEEEkeywords}
+
+\section{Introduction}
+Interactive screen sharing is a joint media-and-control problem. Video frames
+consume most of the available bandwidth, while input and session-control
+messages are small but sensitive to delay. A transport that is suitable for
+one workload may be poor for the other: a high-throughput link can deliver
+smooth video, whereas a low-rate nearby link may still carry useful control
+traffic after the video quality has become unacceptable. Existing screen
+sharing systems commonly assume a stable IP path or bind their device
+integration to a particular operating system.
+
+We investigate a communication architecture intended to preserve an
+interactive session across heterogeneous nearby links. The application
+protocol is separated from the link driver so that a session can use local
+IP (e.g., Wi-Fi), a direct USB OTG connection, or a low-bandwidth Bluetooth
+path without changing message semantics. The design treats fallback as a
+media-adaptation problem as well as a connection-management problem: control
+traffic is retained at high priority, while video is reduced or suspended
+when the available path cannot sustain its configured rate.
+
+This paper makes three contributions:
+\begin{itemize}
+  \item A transport-independent session and framing design for interactive
+  video and control traffic across IP and non-IP proximity links.
+  \item A candidate future-work policy for context-dependent protocol
+  selection using payload class, link availability, measured performance,
+  workload priorities, and hysteresis.
+  \item An evaluation protocol and result templates covering latency,
+  goodput, handover disruption, frame freshness, and cross-platform
+  implementation cost.
+\end{itemize}
+
+These contributions distinguish implemented functionality from proposed
+extension. The current prototype provides continuous video streaming and
+transport fallback across the transports integrated in the system. The
+payload-aware automatic protocol-selection policy described below is not yet
+implemented. We therefore document the existing behavior, define an
+evaluation plan, and leave quantitative results as placeholders.
+
+\section{Problem and Design Goals}
+\subsection{Communication Model}
+We consider two nearby nodes, a sender and a receiver, participating in an
+interactive session. The session carries three logical classes of data:
+\begin{enumerate}
+  \item \textit{Control}: user input, acknowledgements, capability exchange,
+  and session state.
+  \item \textit{Media}: encoded video frames, optionally accompanied by
+  timing and key-frame metadata.
+  \item \textit{Management}: discovery, transport establishment, health
+  reports, and handover coordination.
+\end{enumerate}
+The target setting does not require an external router or cloud service.
+Interfaces and transport protocols vary by endpoint; therefore, the
+application layer must not depend on a particular operating-system socket,
+USB, or Bluetooth API.
+
+\subsection{Goals and Non-Goals}
+The design goals are (i) consistent message semantics across transports,
+(ii) bounded control latency, (iii) prevention of stale-frame queue buildup,
+(iv) continuity of the session when a usable fallback exists, and (v)
+platform-specific code isolated in transport adapters. This work does not
+assume that all transports can carry all media at equal quality. It does not
+claim bit-identical performance across operating systems, nor does the
+current prototype provide production-grade authentication, encryption, or
+continuous video.
+
+\section{Architecture}
+\subsection{Layer Separation}
+The proposed stack has four layers:
+\begin{enumerate}
+  \item \textit{Application}: capture, encode/decode, and user-input handling.
+  \item \textit{Session}: peer identity, capabilities, message classes,
+  sequencing, timestamps, and stream lifecycle.
+  \item \textit{Transport-independent framing}: bounded message headers and
+  payloads, with explicit message type and delivery/expiry semantics.
+  \item \textit{Transport adapters}: OS-specific implementations for local
+  IP, USB OTG, and Bluetooth.
+\end{enumerate}
+A common adapter interface exposes establishment, send/receive, health, and
+close operations. It does not expose assumptions such as an IP address to
+the session layer. An adapter may internally provide a byte stream or
+datagram service; framing and reassembly are selected to match that service.
+This separation permits an implementation to add an adapter without
+rewriting media or control logic.
+
+Each framed message should identify its session, class, sequence number, and
+generation timestamp. A video message also carries frame or stream
+identification sufficient to discard obsolete data. Control messages use
+bounded queues and explicit delivery semantics; media messages are subject to
+deadlines. Exact field widths, authentication, and wire compatibility are
+implementation decisions that must be fixed before interoperability testing.
+
+\subsection{Transport Roles and USB OTG}
+Wi-Fi/IP is the expected high-goodput path for video. USB OTG is a candidate
+direct path when a device is attached as host or gadget; the adapter must
+account for which endpoint controls enumeration and which USB class or
+interface is available. USB availability alone does not imply a compatible
+peer or an active application session. Bluetooth is treated as a constrained
+fallback suitable for control and, only if measured capacity permits, a
+severely reduced visual stream. The design does not assume that Bluetooth
+can sustain general-purpose full-resolution video.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.94\columnwidth}{\centering
+\textbf{Architecture figure placeholder}\\[2pt]
+Application capture / input
+$\rightarrow$ session framing and scheduler
+$\rightarrow$ IP, USB OTG, or Bluetooth adapters\\
+Show peer capability exchange, link-health feedback, and fallback control
+path in the final figure.}}
+\caption{Proposed separation of application traffic from heterogeneous link adapters.}
+\label{fig:architecture}
+\end{figure}
+
+\section{Scheduling and Fallback}
+\subsection{Traffic Treatment}
+Control messages are scheduled ahead of bulk media, with queue limits to
+avoid head-of-line delay caused by large frame transfers. For each video
+frame, the sender attaches a capture timestamp and discards frames whose
+deadline has passed before transmission. Where the encoder supports it,
+adaptation may reduce bitrate, resolution, or frame rate; if no useful
+visual rate can be sustained, the system continues control-only operation
+and exposes the degraded state to the user.
+
+\subsection{Candidate Selection Policy}
+Let $T$ be the set of available transports. For transport $i$, estimate
+round-trip time $L_i$, jitter $J_i$, effective goodput $B_i$, loss or
+retransmission rate $P_i$, energy cost $E_i$, and transition cost $S_i$.
+A candidate score for workload $w$ is
+\begin{equation}
+C_i(w) = \alpha_w L_i + \beta_w J_i +
+\frac{\gamma_w}{B_i+\epsilon} + \delta_w P_i +
+\eta_w E_i + \kappa_w S_i ,
+\label{eq:cost}
+\end{equation}
+where weights depend on whether the session prioritizes interactive control,
+visual quality, or energy use. A candidate is eligible only if it meets
+minimum workload-specific constraints, such as a minimum control service
+rate. The score is a design hypothesis; its weights and thresholds require
+empirical calibration and are not yet selected.
+
+The existing fallback mechanism handles loss or degradation of the active
+transport. The context-dependent selector described here is future work: it
+would select a protocol using the inter-node payload class and measured link
+conditions rather than connectivity alone. In that design, it would not
+switch on a single transient sample; it would require sustained degradation
+before switching down and a sustained improvement margin before switching
+back. A handover would retain session state and control sequence numbers while
+discarding late data from the old path. The current implementation's exact
+fallback triggers, recovery behavior, and supported transport pairs should
+be recorded with the experiment configuration.
+
+\section{Prototype Status}
+The current system combines a Flutter interface with a Rust communication
+backend and supports continuous video streaming and transport fallback.
+Fallback and streaming are treated as implemented capabilities; their
+performance and coverage across operating systems and transport pairs remain
+to be quantified in the evaluation. The system does not yet perform
+context-dependent automatic protocol selection based on inter-node payload
+type (for example, distinguishing control messages from video when choosing
+a transport). That selector, including its policy thresholds and adaptation
+behavior, is proposed future work rather than a measured feature of the
+current prototype.
+
+\section{Experimental Methodology}
+\subsection{Questions}
+The evaluation should answer:
+\begin{itemize}
+  \item \textbf{RQ1:} How do latency, jitter, goodput, and frame freshness
+  differ across the supported links and tested operating systems?
+  \item \textbf{RQ2:} What interruption and loss of control responsiveness
+  occur during fallback and recovery?
+  \item \textbf{RQ3:} Does traffic prioritization preserve control
+  responsiveness when video saturates a constrained link?
+  \item \textbf{RQ4:} Under an explicit energy budget, can the proposed
+  energy-aware selector reduce device energy use while preserving control
+  service, compared with the existing fallback?
+  \item \textbf{RQ5:} What portion of the implementation is shared across
+  operating systems, and what runtime/resource costs accompany the design?
+\end{itemize}
+
+\subsection{Setup and Procedure}
+Use at least one Android device and one desktop endpoint for each supported
+platform, documenting model, OS version, radio configuration, USB role,
+codec, resolution, and power mode. Report direct-link and baseline conditions
+separately. For each transport, run a control-only workload, a fixed-rate
+video workload, and a mixed interactive workload. Repeat trials across
+multiple link conditions and report sample counts, median, 95th percentile,
+dispersion, and confidence intervals. Randomize run order where practical.
+
+For fallback-delay tests, trigger the conditions handled by the existing
+mechanism, such as abrupt loss of the active link. Separately test gradual
+degradation below a configured service threshold for the proposed selector.
+Timestamp (i) the trigger, (ii) degradation detection, (iii) selection of the replacement
+transport, (iv) readiness of that transport, (v) delivery of the first
+control message, and (vi) display of the first valid, non-stale video frame.
+Report each interval separately as well as total control interruption and
+video interruption; this distinguishes slow detection from slow reconnection
+or media recovery. Test each supported ordered transport pair, including
+fallback and recovery directions, and record failed transitions, lost or
+expired frames, and control-message delay. Compare the existing fallback with a fixed-link baseline. Evaluate the
+future payload-aware selector separately, against the existing fallback and,
+if implemented, a no-hysteresis policy.
+
+For evaluation of the proposed energy-aware selector, define a device energy reserve or remaining
+runtime budget before each trial, then exercise the selector at several
+reserve levels under matched control-only and mixed video/control workloads.
+Record the state and threshold that caused a decision, selected transport,
+quality reduction, and any time spent in control-only mode. Measure device
+power with an external power meter where possible; otherwise use a documented
+platform energy estimate and identify it as an estimate. Subtract or report
+idle power separately, and normalize energy by session duration and delivered
+useful frames. Compare the energy-aware policy against the same session with
+energy weighting disabled. A lower-power transport must be established by
+measurement rather than assumed from its link type; report control latency
+and frame freshness alongside energy savings to expose quality trade-offs.
+Keep device, battery state, workload, and radio conditions matched across
+paired runs.
+
+\subsection{Metrics}
+Measure end-to-end control RTT and one-way delay where clock synchronization
+allows; video goodput; frame age at display; delivered and expired frame
+counts; frame rate; fallback detection, selection, readiness, and recovery
+delays; control and video interruption; reconnection success; CPU, memory,
+and energy; and shared versus platform-specific source lines. For energy
+trials report measurement equipment or estimation method, idle baseline,
+incremental energy, and energy per useful delivered frame. State the
+capture-to-display measurement method and clock error. Network RTT must not
+be presented as capture-to-display latency.
+
+\section{Results}
+\textit{No experiment results are available in this draft. Replace every
+placeholder with measured values and the specified test conditions before
+submission.}
+
+\begin{table}[t]
+\caption{Per-Transport Performance (Placeholder)}
+\label{tab:transport-results}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Transport & Goodput & Control RTT & Jitter & Frame age & Energy\\
+ & (Mb/s) & (ms) & (ms) & (ms) & (mWh/min)\\
+\midrule
+Wi-Fi & TBD & TBD & TBD & TBD & TBD\\
+USB OTG & TBD & TBD & TBD & TBD & TBD\\
+Bluetooth & TBD & TBD & TBD & TBD & TBD\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{Fallback and Recovery Delay (Placeholder)}
+\label{tab:handover-results}
+\centering
+\scriptsize
+\begin{tabular}{lccccc}
+\toprule
+Transition & Detect & Select & Ready & Control & Video\\
+ & (ms) & (ms) & (ms) & gap (ms) & gap (ms)\\
+\midrule
+Wi-Fi $\rightarrow$ USB & TBD & TBD & TBD & TBD & TBD\\
+USB $\rightarrow$ Bluetooth & TBD & TBD & TBD & TBD & TBD\\
+Wi-Fi $\rightarrow$ Bluetooth & TBD & TBD & TBD & TBD & TBD\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{Energy-Constrained Fallback (Placeholder)}
+\label{tab:energy-fallback-results}
+\centering
+\scriptsize
+\begin{tabular}{lccccc}
+\toprule
+Policy & Reserve & Selected & Energy & Control & Frame\\
+ & (Wh or \%) & link & saving (\%) & RTT (ms) & age (ms)\\
+\midrule
+Energy-aware & TBD & TBD & TBD & TBD & TBD\\
+Energy weight off & TBD & TBD & TBD & TBD & TBD\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.94\columnwidth}{\centering
+\textbf{Results plot placeholder}\\[2pt]
+Plot control RTT and displayed frame age over time for a forced
+Wi-Fi-to-fallback transition. Mark degradation trigger, detection,
+replacement-link readiness, first control delivery, and first valid frame.}}
+\caption{Suggested timeline for measuring fallback delay and interruption.}
+\label{fig:handover}
+\end{figure}
+
+\section{Discussion}
+The main design trade-off is continuity versus quality: a fallback may keep
+control available while providing little or no useful video. Therefore,
+success should not be defined only as socket/session survival. Evaluation
+must separately report control continuity, frame freshness, and visual
+quality. In particular, reliable retransmission of expired video can worsen
+interactive performance; policy should be selected by message class rather
+than by a single transport-wide reliability setting.
+
+Transport portability also does not imply equivalent platform capabilities.
+USB OTG role negotiation and device permissions differ across operating
+systems, while Bluetooth profiles and throughput vary by device. These
+differences must be reported as limitations, not hidden behind the common
+adapter interface. Security is another prerequisite: the current Wi-Fi
+prototype is intended for trusted LAN testing and lacks production
+authentication and encryption. A deployable system must authenticate peers
+and protect control and media traffic independently of link type.
+
+\section{Related Work}
+Screen-sharing studies compare native and clientless approaches and motivate
+measuring end-to-end behavior rather than inferring user experience from
+transport throughput alone \cite{huang2021}. Handover research has examined
+predicting Wi-Fi loss and preparing alternate paths using multipath transport
+\cite{hochst2019}. Such work informs link monitoring and continuity, but the
+present design focuses on application-level interactive media and control
+across IP and non-IP proximity transports. Media-independent handover
+standards provide a broader framework for separating link events from
+higher-layer decisions \cite{ieee80221}.
+
+The contribution sought here is not a new codec or a claim that Rust or
+cross-platform UI frameworks are novel. It is the integration and evaluation
+of a transport-independent interactive session model, traffic-aware
+degradation, and fallback across distinct local link types. This claim
+remains to be tested against implemented systems and measured baselines.
+
+\section{Limitations and Future Work}
+The current system supports continuous video streaming and transport
+fallback, but this draft contains no measured performance, energy,
+reliability, or code-sharing results. The principal future-work item is
+context-dependent automatic protocol selection using inter-node payload
+characteristics together with measured link conditions. Future evaluation
+must compare this selector with the existing fallback, quantify its effects
+on control delay, frame freshness, and energy use, and document the supported
+transport/operating-system combinations. Broader multi-node routing and
+battery-aware topology selection are outside the scope of this pairwise
+study.
+
+\section{Conclusion}
+We presented a design for inter-node interactive streaming that separates
+session semantics from operating-system-specific transport adapters and
+gives control and video distinct scheduling and degradation behavior.
+The current prototype provides continuous video streaming and transport
+fallback. Context-dependent automatic protocol selection based on inter-node
+payload remains future work, and the performance and energy benefits of both
+the existing fallback and that proposed extension must be established
+empirically.
+
+\begin{thebibliography}{00}
+
+\bibitem{huang2021}
+C.-Y. Huang, Y.-C. Cheng, G.-Z. Huang, C.-L. Fan, and C.-H. Hsu,
+``On the performance comparisons of native and clientless real-time screen
+sharing technologies,'' \emph{ACM Transactions on Multimedia Computing,
+Communications, and Applications}, vol. 17, no. 2, Art. no. 54, 2021,
+doi: 10.1145/3437881.
+
+\bibitem{hochst2019}
+J. H{\"o}chst \emph{et al.}, ``Learning Wi-Fi connection loss predictions
+for seamless vertical handovers using Multipath TCP,'' in
+\emph{Proc. IEEE 44th Conference on Local Computer Networks (LCN)}, 2019,
+doi: 10.1109/LCN44214.2019.8990753.
+
+\bibitem{ieee80221}
+IEEE, \emph{IEEE Standard for Local and Metropolitan Area Networks---Media
+Independent Handover Services}, IEEE Std 802.21-2008, 2009.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,8 +1,10 @@
+mod tunnel;
 mod udp;
 
 #[cfg(feature = "usb")]
 mod usb;
 
+pub use tunnel::{TunnelConfig, TunnelTransport};
 pub use udp::{UdpConfig, UdpTransport};
 
 #[cfg(feature = "usb")]

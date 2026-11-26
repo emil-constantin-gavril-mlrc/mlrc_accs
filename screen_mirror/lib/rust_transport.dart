@@ -9,11 +9,13 @@ typedef _StartNative = ffi.Int32 Function(
   ffi.Uint16,
   ffi.Uint32,
   ffi.Uint16,
+  ffi.Uint32,
   ffi.Pointer<ffi.Pointer<ffi.Void>>,
   ffi.Pointer<ffi.Char>,
   ffi.IntPtr,
 );
 typedef _StartDart = int Function(
+  int,
   int,
   int,
   int,
@@ -115,6 +117,7 @@ class RustTransport {
     required int localPort,
     required String peerAddress,
     required int peerPort,
+    bool tunnel = false,
   }) {
     if (_watcher != null) {
       throw StateError('The Rust transport is already running.');
@@ -141,6 +144,7 @@ class RustTransport {
         localPort,
         address.rawAddress.fold<int>(0, (value, octet) => (value << 8) | octet),
         peerPort,
+        tunnel ? 1 : 0,
         output,
         error,
         _errorCapacity,

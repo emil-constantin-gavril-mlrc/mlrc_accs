@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
+import 'app_log.dart';
 import 'debug_services.dart';
 import 'screen_capture_service.dart';
 import 'rust_transport.dart';
 
 void main() {
+  AppLog.init();
   runApp(const WatcherTerminalApp());
 }
 
@@ -62,6 +65,9 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   late final LocalPeerDiscovery _peerDiscovery;
   RustTransport? _rustTransport;
   Timer? _receivePollTimer;
+  Timer? _streamTimer;
+  bool _queueFullLogged = false;
+  String _transportLabel = 'Rust UDP';
   bool _isCapturing = false;
   bool _isDiscovering = false;
   int _lastLoggedSentBytes = 0;
@@ -70,11 +76,18 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   Uint8List? _screenshot;
   List<DiscoveredNode> _networkNodes = [];
   List<AdbDevice> _adbDevices = [];
+  List<DiscoveredNode> _adbNodes = [];
+  final TextEditingController _manualAddressController =
+      TextEditingController();
   int _screencapCount = 0;
   String _lastScreencapTime = 'Never';
   String? _selectedPeerId;
 
-  String get _commType => _isStreaming ? 'Wi-Fi (Rust UDP)' : 'Wi-Fi';
+  String get _commType => _isStreaming
+      ? (_transportLabel == 'Rust UDP'
+            ? 'Wi-Fi (Rust UDP)'
+            : 'USB (ADB tunnel)')
+      : 'Wi-Fi';
 
   @override
   void initState() {
@@ -82,14 +95,27 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     _activeMode = _envMode;
     _peerDiscovery = LocalPeerDiscovery(
       onNodesChanged: (nodes) {
-        if (mounted) {
-          setState(() {
-            _networkNodes = nodes;
-            if (!nodes.any((node) => node.id == _selectedPeerId)) {
-              _selectedPeerId = nodes.isEmpty ? null : nodes.first.id;
-            }
-          });
+        if (!mounted) return;
+        final knownIds = _networkNodes.map((node) => node.id).toSet();
+        for (final node in nodes) {
+          if (!knownIds.contains(node.id)) {
+            _logEvent(
+              '[Discovery] Peer "${node.id}" reachable at '
+              '${node.address}:${node.port}'
+              '${node.allAddresses.length > 1 ? ' (all IPv4: ${node.allAddresses.join(', ')})' : ''}.',
+            );
+          }
         }
+        setState(() {
+          _networkNodes = nodes;
+          final selectedStillKnown =
+              _selectedPeerId != null &&
+              (nodes.any((node) => node.id == _selectedPeerId) ||
+                  _adbNodes.any((node) => node.id == _selectedPeerId));
+          if (!selectedStillKnown) {
+            _selectedPeerId = nodes.isEmpty ? null : nodes.first.id;
+          }
+        });
       },
       onError: (error) {
         if (mounted) _logEvent('[Discovery error] $error');
@@ -117,18 +143,22 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
 
   @override
   void dispose() {
-    _receivePollTimer?.cancel();
-    _rustTransport?.stop();
-    unawaited(_peerDiscovery.stop());
+    unawaited(_stopWatcher());
+    unawaited(
+      _peerDiscovery.stop().catchError((Object error) {
+        AppLog.line('[Discovery] shutdown stop problem: $error');
+      }),
+    );
+    _manualAddressController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  Future<void> _captureScreen() async {
+  Future<void> _captureScreen({bool periodic = false}) async {
     setState(() => _isCapturing = true);
-    _logEvent(
-      '[Capture] Screen capture requested. Approve the system prompt if shown.',
-    );
+    if (!periodic) {
+      _logEvent('[Capture] Capturing the next screen frame.');
+    }
     try {
       final image = await _screenCaptureService.captureCurrentScreen();
       if (!mounted) return;
@@ -140,15 +170,28 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
           19,
         );
       });
-      _logEvent(
-        '[Capture] Screen captured in memory (#$_screencapCount, ${image.length} bytes); temporary capture data was removed.',
-      );
+      if (!periodic || _screencapCount % 20 == 1) {
+        _logEvent(
+          '[Capture] Screen captured in memory (#$_screencapCount, ${image.length} bytes); temporary capture data was removed.',
+        );
+      }
       if (_isStreaming && _activeMode == 'Transmit') {
         try {
           _rustTransport!.sendFrame(image);
-          _logEvent('[Network] Queued $_screencapCount frame for Rust UDP.');
+          _queueFullLogged = false;
+          if (!periodic || _screencapCount % 20 == 1) {
+            _logEvent(
+              '[Network] Queued $_screencapCount frame over $_transportLabel.',
+            );
+          }
         } catch (error) {
-          _logEvent('[Network error] Could not queue frame: $error');
+          if (!_queueFullLogged) {
+            _queueFullLogged = true;
+            _logEvent(
+              '[Network warning] Dropping frames: $error Captures keep '
+              'running; queueing resumes automatically once the peer drains.',
+            );
+          }
         }
       }
     } catch (error) {
@@ -164,16 +207,27 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
 
   Future<void> _toggleDeviceDiscovery() async {
     if (_isDiscovering) {
+      String? stopFailure;
       try {
         await _peerDiscovery.stop();
-        if (!mounted) return;
-        setState(() {
-          _isDiscovering = false;
-          _networkNodes = [];
-        });
-        _logEvent('[Discovery] Local peer discovery stopped.');
       } catch (error) {
-        if (mounted) _logEvent('[Discovery error] $error');
+        stopFailure = '$error';
+      }
+      if (!mounted) return;
+      // The toggle must flip to "not discovering" even when teardown
+      // reported problems: stop() always releases the resources it owns,
+      // and a stuck-on toggle would block starting discovery again.
+      setState(() {
+        _isDiscovering = false;
+        _networkNodes = [];
+      });
+      if (stopFailure == null) {
+        _logEvent('[Discovery] Local peer discovery stopped.');
+      } else {
+        _logEvent(
+          '[Discovery warning] Local peer discovery stopped with cleanup '
+          'problems: $stopFailure',
+        );
       }
       return;
     }
@@ -197,7 +251,10 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     if (!mounted) return;
     if (Theme.of(context).platform == TargetPlatform.android) {
       _logEvent(
-        '[USB] ADB discovery is available when the app runs on a Windows or Linux host.',
+        '[USB] This app is running on the phone. For a direct USB session, '
+        'keep the phone attached over ADB, run MLRC ACCS on the desktop '
+        'with peer discovery on, then press "USB host (ADB tunnel)" to add '
+        'the desktop as a peer.',
       );
       return;
     }
@@ -207,6 +264,52 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       if (!mounted) return;
       setState(() => _adbDevices = devices);
       _logEvent('[USB] ADB reported ${devices.length} connected device(s).');
+      final seeded = <DiscoveredNode>[];
+      for (final device in devices) {
+        if (device.status != 'device') {
+          continue;
+        }
+        final failures = await setupAdbUsbTunnels(device.serial);
+        if (failures.isEmpty) {
+          seeded.add(
+            DiscoveredNode(
+              id: 'USB ${device.description}',
+              address: '127.0.0.1',
+              transport: 'USB (ADB tunnel)',
+              port: LocalPeerDiscovery.usbTunnelPresencePort,
+              allAddresses: const ['127.0.0.1'],
+            ),
+          );
+          _logEvent(
+            '[USB] Tunnelled "${device.description}" across the cable: '
+            'frames travel through 127.0.0.1:${LocalPeerDiscovery.usbTunnelDataPort} '
+            'and presence through 127.0.0.1:${LocalPeerDiscovery.usbTunnelPresencePort} '
+            '(adb forward/reverse applied). Select it and press Start for '
+            'a direct USB session.',
+          );
+        } else {
+          _logEvent(
+            '[USB] ADB tunnel setup failed for "${device.description}": '
+            '${failures.join('; ')} The direct USB session will not work '
+            'until the tunnel rules apply (is USB debugging authorized?).',
+          );
+        }
+        final address = await findAdbWlan4Address(device.serial);
+        if (address != null) {
+          seeded.add(
+            DiscoveredNode(
+              id: 'ADB Wi-Fi ${device.description}',
+              address: address,
+              transport: 'ADB-seeded (Wi-Fi path)',
+              port: LocalPeerDiscovery.fixedPresencePort,
+              allAddresses: [address],
+            ),
+          );
+        }
+      }
+      if (mounted) {
+        setState(() => _adbNodes = seeded);
+      }
     } catch (error) {
       if (mounted) {
         _logEvent('[USB discovery error] $error');
@@ -215,6 +318,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
   }
 
   void _logEvent(String message) {
+    AppLog.line(message);
     setState(() {
       final timestamp = DateTime.now()
           .toIso8601String()
@@ -234,13 +338,60 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     });
   }
 
+  /// mDNS, ADB-seeded, and manually added peers share one picker; peers with
+  /// the same IPv4 are only listed once (the mDNS entry wins).
+  List<DiscoveredNode> _peerPickerItems() {
+    final seenAddresses = <String>{};
+    return [..._networkNodes, ..._adbNodes].where((node) {
+      if (node.address == 'IPv4 address unavailable') {
+        return true;
+      }
+      return seenAddresses.add(node.address);
+    }).toList();
+  }
+
+  void _addManualPeer() {
+    final raw = _manualAddressController.text.trim();
+    if (raw.isEmpty) {
+      _logEvent('[Manual] Type the peer\u2019s IPv4 address, then press Add.');
+      return;
+    }
+    try {
+      final node = _peerDiscovery.addManualNode(raw);
+      _manualAddressController.clear();
+      setState(() => _selectedPeerId = node.id);
+      _logEvent(
+        '[Manual] Added "${node.id}" at ${node.address}:${node.port} and '
+        'selected it. Press Start Transmitting or Start Receiving to '
+        'connect now, without waiting for discovery.',
+      );
+    } catch (error) {
+      _logEvent('[Manual error] $error');
+    }
+  }
+
+  void _addUsbHostPeer() {
+    try {
+      final node = _peerDiscovery.addUsbTunnelNode();
+      setState(() => _selectedPeerId = node.id);
+      _logEvent(
+        '[USB] Added "${node.id}" at 127.0.0.1:${node.port}. The phone '
+        'reaches the desktop through adb reverse, which the desktop app '
+        'applies while its peer discovery runs with this phone attached. '
+        'Press Start Transmitting or Start Receiving to connect.',
+      );
+    } catch (error) {
+      _logEvent('[USB error] $error');
+    }
+  }
+
   Future<void> _toggleWatcher(String mode) async {
     if (_isStreaming && _activeMode == mode) {
-      _stopWatcher();
+      await _stopWatcher();
       return;
     }
     if (_isStreaming) {
-      _stopWatcher();
+      await _stopWatcher();
     }
 
     if (!_isDiscovering) {
@@ -254,7 +405,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
     }
 
     DiscoveredNode? peer;
-    for (final node in _networkNodes) {
+    for (final node in [..._networkNodes, ..._adbNodes]) {
       if (node.id == _selectedPeerId) {
         peer = node;
         break;
@@ -270,14 +421,102 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       );
       return;
     }
+    final viaUsbTunnel = peer.transport == 'USB (ADB tunnel)';
+    int localPresencePort;
+    try {
+      localPresencePort = _peerDiscovery.port;
+    } on StateError {
+      _logEvent(
+        '[Network error] Local peer discovery is not running any more. '
+        'Toggle Peer Discovery on, then press Start again.',
+      );
+      return;
+    }
+
+    final candidateText = peer.allAddresses.isEmpty
+        ? peer.address
+        : peer.allAddresses.join(', ');
+    _logEvent(
+      '[Network] Presence handshake for "${peer.id}" '
+      '(candidates: $candidateText, port ${peer.port})...',
+    );
+    String reachableAddress;
+    try {
+      reachableAddress = await verifyPeerReachability(peer);
+    } catch (error) {
+      if (viaUsbTunnel) {
+        _logEvent(
+          '[Network error] The USB tunnel probe for "${peer.id}" failed: '
+          '$error Keep the cable attached and the phone unlocked, make sure '
+          'the peer app is running with discovery on, and (on the desktop '
+          'side) toggle peer discovery once more so the adb tunnel rules '
+          'are reapplied for this device.',
+        );
+      } else {
+        _logEvent(
+          '[Network error] Cannot reach "${peer.id}" on port ${peer.port}. '
+          '$error Verify the peer is running MLRC ACCS with discovery on, '
+          'both devices share one Wi-Fi network, and the Windows firewall '
+          'allows inbound UDP and TCP on port ${peer.port} (the Wi-Fi '
+          'network profile should be Private).',
+        );
+      }
+      return;
+    }
+    if (reachableAddress != peer.address) {
+      _logEvent(
+        '[Network] Preferred ${peer.address} did not answer; the presence '
+        'handshake succeeded on $reachableAddress instead. Using it.',
+      );
+      peer = DiscoveredNode(
+        id: peer.id,
+        address: reachableAddress,
+        transport: peer.transport,
+        port: peer.port,
+        status: peer.status,
+        allAddresses: peer.allAddresses,
+      );
+    }
+    _logEvent(
+      '[Network] Reachability to $reachableAddress:${peer.port} confirmed.',
+    );
 
     try {
+      if (mode == 'Transmit') {
+        _logEvent(
+          '[Capture] Starting capture for this session. On Android, approve '
+          'the system prompt once; subsequent frames reuse that permission.',
+        );
+        await _screenCaptureService.startContinuousCapture();
+      }
       final transport = RustTransport();
+      _transportLabel = viaUsbTunnel ? 'Rust USB tunnel' : 'Rust UDP';
+      final localDataPort = viaUsbTunnel
+          ? LocalPeerDiscovery.usbTunnelDataPort
+          : localPresencePort;
+      final peerDataAddress = viaUsbTunnel ? '127.0.0.1' : peer.address;
+      final int peerDataPort;
+      if (!viaUsbTunnel) {
+        peerDataPort = peer.port;
+      } else if (mode == 'Receive') {
+        peerDataPort = LocalPeerDiscovery.usbTunnelDataPort;
+      } else if (Platform.isAndroid) {
+        peerDataPort = LocalPeerDiscovery.usbTunnelPhoneConnectPort;
+      } else {
+        peerDataPort = LocalPeerDiscovery.usbTunnelHostConnectPort;
+      }
       transport.start(
         transmitting: mode == 'Transmit',
-        localPort: _peerDiscovery.port,
-        peerAddress: peer.address,
-        peerPort: peer.port,
+        localPort: localDataPort,
+        peerAddress: peerDataAddress,
+        peerPort: peerDataPort,
+        tunnel: viaUsbTunnel,
+      );
+      _logEvent(
+        '[Transport] ${mode == 'Transmit' ? 'Transmitter' : 'Receiver'} '
+        'session active: '
+        '${viaUsbTunnel ? 'USB (ADB tunnel) 127.0.0.1:$localDataPort' : 'UDP $localDataPort'} '
+        '<-> $peerDataAddress:$peerDataPort.',
       );
       setState(() {
         _rustTransport = transport;
@@ -287,13 +526,15 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       _lastLoggedSentBytes = 0;
       _receiveStartedAt = mode == 'Receive' ? DateTime.now() : null;
       _loggedReceiveTimeout = false;
+      _queueFullLogged = false;
       _logEvent(
-        '[Network] Rust UDP $mode session started; local port ${_peerDiscovery.port}, '
-        'peer ${peer.address}:${peer.port}.',
+        '[Network] $_transportLabel $mode session started; local port '
+        '$localDataPort, peer $peerDataAddress:$peerDataPort.',
       );
       if (mode == 'Receive') {
         _logEvent(
-          '[Network] Listening for Rust UDP frames from ${peer.address}:${peer.port}.',
+          '[Network] Listening for $_transportLabel frames from '
+          '$peerDataAddress:$peerDataPort.',
         );
       }
       _receivePollTimer = Timer.periodic(
@@ -302,21 +543,40 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
       );
 
       if (mode == 'Transmit') {
-        await _captureScreen();
+        unawaited(_captureScreen());
+        _streamTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+          if (_isStreaming && _activeMode == 'Transmit' && !_isCapturing) {
+            unawaited(_captureScreen(periodic: true));
+          }
+        });
+        _logEvent(
+          '[Capture] Continuous capture armed: the next frame is captured '
+          'as soon as the previous capture finishes (the desktop targets '
+          'about 4 frames per second; Android is limited by screencap '
+          'speed).',
+        );
       }
     } catch (error) {
       if (mounted) {
-        _stopWatcher();
+        await _stopWatcher();
         _logEvent('[Network error] Could not start $mode: $error');
       }
     }
   }
 
-  void _stopWatcher() {
+  Future<void> _stopWatcher() async {
     _receivePollTimer?.cancel();
     _receivePollTimer = null;
+    _streamTimer?.cancel();
+    _streamTimer = null;
+    _queueFullLogged = false;
     _rustTransport?.stop();
     _rustTransport = null;
+    try {
+      await _screenCaptureService.stopContinuousCapture();
+    } catch (error) {
+      AppLog.line('[Capture] Could not stop Android screen capture: $error');
+    }
     _receiveStartedAt = null;
     _loggedReceiveTimeout = false;
     _lastLoggedSentBytes = 0;
@@ -348,7 +608,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
         _receiveStartedAt = DateTime.now();
         _loggedReceiveTimeout = false;
         _logEvent(
-          '[Network] Received frame (${frame.length} bytes) over Rust UDP.',
+          '[Network] Received frame (${frame.length} bytes) over $_transportLabel.',
         );
       }
       if (mode == 'Transmit') {
@@ -369,13 +629,15 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                 const Duration(seconds: 10)) {
           _loggedReceiveTimeout = true;
           _logEvent(
-            '[Network warning] No UDP frame received in 10 seconds. Check that the peer is transmitting to this device’s advertised IP/port and that the network/firewall allows UDP.',
+            '[Network warning] No $_transportLabel frame received in 10 seconds. Check that the peer is transmitting to this device’s advertised address and that the link (Wi-Fi/firewall, or the USB tunnel) is up.',
           );
         }
       }
     } catch (error) {
-      _stopWatcher();
-      _logEvent('[Network error] Rust UDP $mode session failed: $error');
+      unawaited(_stopWatcher());
+      _logEvent(
+        '[Network error] $_transportLabel $mode session failed: $error',
+      );
     }
   }
 
@@ -472,7 +734,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                           ),
                         ],
                       ),
-                      if (_networkNodes.isEmpty)
+                      if (_networkNodes.isEmpty && _adbNodes.isEmpty)
                         const Text(
                           'Start discovery on both devices, then select the peer here.',
                           style: TextStyle(color: Colors.white60, fontSize: 12),
@@ -486,7 +748,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                             border: OutlineInputBorder(),
                           ),
                           hint: const Text('Select a discovered peer'),
-                          items: _networkNodes
+                          items: _peerPickerItems()
                               .map(
                                 (node) => DropdownMenuItem(
                                   value: node.id,
@@ -502,8 +764,47 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                               : (peerId) =>
                                     setState(() => _selectedPeerId = peerId),
                         ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextFormField(
+                              controller: _manualAddressController,
+                              enabled: !_isStreaming,
+                              onFieldSubmitted: (_) => _addManualPeer(),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                border: OutlineInputBorder(),
+                                hintText: 'Or connect manually: peer IPv4',
+                                hintStyle: TextStyle(
+                                  color: Colors.white38,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          FilledButton.tonalIcon(
+                            onPressed: _isStreaming ? null : _addManualPeer,
+                            icon: const Icon(Icons.add_link, size: 16),
+                            label: const Text('Add'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      if (isAndroid) ...[
+                        OutlinedButton.icon(
+                          onPressed: _isStreaming ? null : _addUsbHostPeer,
+                          icon: const Icon(Icons.usb, size: 16),
+                          label: const Text('USB host (ADB tunnel)'),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
                       const Text(
-                        'This prototype sends one still frame per capture; it does not stream live video.',
+                        'Transmitting captures continuously while the session is active; peer discovery also arms the USB (ADB tunnel) link for attached phones.',
                         style: TextStyle(color: Colors.white60, fontSize: 11),
                       ),
                       const SizedBox(height: 12),
@@ -931,7 +1232,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                   ),
                 ],
               ),
-              if (_networkNodes.isEmpty)
+              if (_networkNodes.isEmpty && _adbNodes.isEmpty)
                 const Text(
                   'Start discovery on both devices, then select the peer here.',
                   style: TextStyle(color: Colors.white60, fontSize: 12),
@@ -945,7 +1246,7 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                     border: OutlineInputBorder(),
                   ),
                   hint: const Text('Select a discovered peer'),
-                  items: _networkNodes
+                  items: _peerPickerItems()
                       .map(
                         (node) => DropdownMenuItem(
                           value: node.id,
@@ -961,9 +1262,44 @@ class _TerminalDashboardState extends State<TerminalDashboard> {
                       ? null
                       : (peerId) => setState(() => _selectedPeerId = peerId),
                 ),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextFormField(
+                      controller: _manualAddressController,
+                      enabled: !_isStreaming,
+                      onFieldSubmitted: (_) => _addManualPeer(),
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      decoration: const InputDecoration(
+                        isDense: true,
+                        border: OutlineInputBorder(),
+                        hintText: 'Manual peer IPv4',
+                        hintStyle: TextStyle(
+                          color: Colors.white38,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton.tonalIcon(
+                    onPressed: _isStreaming ? null : _addManualPeer,
+                    icon: const Icon(Icons.add_link, size: 16),
+                    label: const Text('Add'),
+                  ),
+                ],
+              ),
               const SizedBox(height: 4),
+              if (isAndroid) ...[
+                OutlinedButton.icon(
+                  onPressed: _isStreaming ? null : _addUsbHostPeer,
+                  icon: const Icon(Icons.usb, size: 16),
+                  label: const Text('USB host (ADB tunnel)'),
+                ),
+                const SizedBox(height: 4),
+              ],
               const Text(
-                'Sends one still frame per capture; this is not live video.',
+                'Transmitting captures continuously while a session is active.',
                 style: TextStyle(color: Colors.white60, fontSize: 11),
               ),
               const SizedBox(height: 10),

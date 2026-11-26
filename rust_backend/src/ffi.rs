@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::transport::UdpConfig;
+use crate::transport::{TunnelConfig, TunnelTransport, UdpConfig};
 use crate::{BackendError, CommPreference, OperationMode, Watcher, WatcherConfig};
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -59,6 +59,7 @@ fn build_watcher(
     local_port: u16,
     peer_ipv4: u32,
     peer_port: u16,
+    comm: u32,
 ) -> Result<Watcher, BackendError> {
     let peer = Ipv4Addr::new(
         (peer_ipv4 >> 24) as u8,
@@ -66,6 +67,25 @@ fn build_watcher(
         (peer_ipv4 >> 8) as u8,
         peer_ipv4 as u8,
     );
+    if comm == 1 {
+        // USB over the adb tunnel: the cable link is loopback TCP framed by
+        // adbd, so the same wire format as the rusb bulk transport applies.
+        let tunnel = TunnelConfig {
+            listen_port: if mode == OperationMode::Receive {
+                Some(local_port)
+            } else {
+                None
+            },
+            connect_address: if mode == OperationMode::Transmit {
+                Some(SocketAddr::new(IpAddr::V4(peer), peer_port))
+            } else {
+                None
+            },
+            ..TunnelConfig::default()
+        };
+        let transport = TunnelTransport::new(tunnel)?;
+        return Ok(Watcher::with_transport(mode, Box::new(transport)));
+    }
     Watcher::new(WatcherConfig {
         mode,
         communication: CommPreference::Wifi,
@@ -128,6 +148,7 @@ pub unsafe extern "C" fn mlrc_watcher_start(
     local_port: u16,
     peer_ipv4: u32,
     peer_port: u16,
+    comm: u32,
     output: *mut *mut FfiWatcher,
     error_buffer: *mut c_char,
     error_capacity: usize,
@@ -160,7 +181,15 @@ pub unsafe extern "C" fn mlrc_watcher_start(
             return -1;
         }
     };
-    let watcher = match build_watcher(mode, local_port, peer_ipv4, peer_port) {
+    if comm > 1 {
+        write_error(
+            "communication kind must be 0 (Wi-Fi UDP) or 1 (USB over adb tunnel)",
+            error_buffer,
+            error_capacity,
+        );
+        return -1;
+    }
+    let watcher = match build_watcher(mode, local_port, peer_ipv4, peer_port, comm) {
         Ok(watcher) => watcher,
         Err(error) => {
             write_error(&error.to_string(), error_buffer, error_capacity);
@@ -350,6 +379,7 @@ mod tests {
                     sender_port,
                     u32::from_be_bytes([127, 0, 0, 1]),
                     receiver_port,
+                    0,
                     &mut sender,
                     error.as_mut_ptr(),
                     error.len(),
@@ -366,6 +396,7 @@ mod tests {
                     receiver_port,
                     u32::from_be_bytes([127, 0, 0, 1]),
                     sender_port,
+                    0,
                     &mut receiver,
                     error.as_mut_ptr(),
                     error.len(),

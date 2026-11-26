@@ -1,14 +1,39 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:desktop_screenshot/desktop_screenshot.dart';
-import 'package:flutter_screen_recording/flutter_screen_recording.dart';
+import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
-import 'package:path_provider/path_provider.dart';
-import 'package:video_thumbnail/video_thumbnail.dart';
 
 class ScreenCaptureService {
+  static const MethodChannel _androidCaptureChannel = MethodChannel(
+    'flutter_screen_recording',
+  );
+
   final DesktopScreenshot _desktopScreenshot = DesktopScreenshot();
+  bool _androidCaptureStarted = false;
+
+  Future<void> startContinuousCapture() async {
+    if (!Platform.isAndroid || _androidCaptureStarted) return;
+
+    final started = await _androidCaptureChannel.invokeMethod<bool>(
+      'startCaptureSession',
+      {
+        'name': 'mlrc_stream_${DateTime.now().millisecondsSinceEpoch}',
+        'title': 'MLRC screen streaming',
+        'message': 'Screen sharing is active',
+      },
+    );
+    if (started != true) {
+      throw StateError('Android did not authorize continuous screen capture.');
+    }
+    _androidCaptureStarted = true;
+  }
+
+  Future<void> stopContinuousCapture() async {
+    if (!Platform.isAndroid || !_androidCaptureStarted) return;
+    _androidCaptureStarted = false;
+    await _androidCaptureChannel.invokeMethod<void>('stopCaptureSession');
+  }
 
   Future<Uint8List> captureCurrentScreen() async {
     if (Platform.isWindows || Platform.isLinux) {
@@ -29,58 +54,22 @@ class ScreenCaptureService {
   }
 
   Future<Uint8List> _captureAndroidScreen() async {
-    final fileName =
-        'mlrc_debug_capture_${DateTime.now().millisecondsSinceEpoch}';
-    final cacheDirectories = await getExternalCacheDirectories();
-    final cacheDirectory =
-        cacheDirectories != null && cacheDirectories.isNotEmpty
-        ? cacheDirectories.first
-        : await getTemporaryDirectory();
-    final temporaryRecording = File(
-      '${cacheDirectory.path}${Platform.pathSeparator}$fileName.mp4',
-    );
-
-    String? recordingPath;
+    final isTemporarySession = !_androidCaptureStarted;
     try {
-      final started = await FlutterScreenRecording.startRecordScreen(
-        fileName,
-        titleNotification: 'MLRC screen capture',
-        messageNotification: 'Capturing one screen preview',
-      );
-      if (!started) {
-        throw StateError(
-          'Android did not start the user-authorized screen capture.',
+      if (isTemporarySession) {
+        await startContinuousCapture();
+      }
+      for (var attempt = 0; attempt < 20; attempt++) {
+        final bytes = await _androidCaptureChannel.invokeMethod<Uint8List>(
+          'captureScreenFrame',
         );
+        if (bytes != null && bytes.isNotEmpty) return bytes;
+        await Future<void>.delayed(const Duration(milliseconds: 50));
       }
-
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
-      recordingPath = await FlutterScreenRecording.stopRecordScreen;
-      if (recordingPath.isEmpty) {
-        throw StateError('Android screen capture returned no recording path.');
-      }
-
-      final bytes = await VideoThumbnail.thumbnailData(
-        video: recordingPath,
-        imageFormat: ImageFormat.JPEG,
-        maxWidth: 960,
-        quality: 75,
-        timeMs: 700,
-      );
-      if (bytes == null || bytes.isEmpty) {
-        throw StateError(
-          'Could not decode a preview frame from the Android capture.',
-        );
-      }
-      return bytes;
+      throw StateError('Android screen capture produced no frame.');
     } finally {
-      if (recordingPath != null &&
-          recordingPath.isNotEmpty &&
-          recordingPath != temporaryRecording.path) {
-        final recording = File(recordingPath);
-        if (await recording.exists()) await recording.delete();
-      }
-      if (await temporaryRecording.exists()) {
-        await temporaryRecording.delete();
+      if (isTemporarySession) {
+        await stopContinuousCapture();
       }
     }
   }

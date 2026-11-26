@@ -144,6 +144,20 @@ impl Watcher {
         })
     }
 
+    /// Wraps a ready-made transport (used by the FFI layer for the USB-over-
+    /// adb tunnel, which has no vendor/product IDs to look up).
+    #[doc(hidden)]
+    pub fn with_transport(
+        mode: OperationMode,
+        transport: Box<dyn Transport>,
+    ) -> Self {
+        Self {
+            mode,
+            transport,
+            fallback_reason: None,
+        }
+    }
+
     pub fn mode(&self) -> OperationMode {
         self.mode
     }

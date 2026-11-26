@@ -53,6 +53,12 @@ The Android implementation uses `MediaProjection`, `MediaRecorder`, and a foregr
 
 The example app requests permissions with `permission_handler` before starting recording.
 
+This repository also uses an Android frame-capture session through the
+`flutter_screen_recording` method channel: `startCaptureSession` requests
+MediaProjection consent once, `captureScreenFrame` returns the latest JPEG
+frame, and `stopCaptureSession` releases the projection. Keep the session open
+while streaming; do not start and stop a recording for every frame.
+
 ## iOS
 
 The iOS implementation uses `ReplayKit` and requires `iOS 11.0+`.

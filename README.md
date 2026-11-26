@@ -1,13 +1,13 @@
 # MLRC ACCS
 
-This repository contains a Flutter-based prototype for screen mirroring over Wi-Fi. The Windows and Android apps can discover one another and send captured still-image frames through the Rust backend. It is not yet a live audio/video streamer; USB transport currently exists only as a standalone Rust option.
+This repository contains a Flutter-based Windows/Android screen-sharing prototype. It continuously captures and sends JPEG screen frames over Wi-Fi or, for an Android phone attached to a desktop, through an ADB forward/reverse TCP tunnel over USB. This is frame streaming rather than an inter-frame video codec or audio/video streaming stack. The optional libusb bulk transport remains a standalone Rust backend option.
 
 ## Project purpose
 
 The codebase is best understood as a UI-oriented prototype for a screen-sharing / remote-display system. It focuses on the operator experience and low-level signal flow modeling rather than a production-ready media stack. The interface exposes controls for:
 
 - toggling between standby, transmit, and receive modes
-- selecting an opted-in Wi-Fi peer and starting a transmit or receive session
+- selecting an opted-in Wi-Fi or ADB-tunnel peer and starting a transmit or receive session
 - observing transport activity in a live terminal log
 - inspecting real local screen captures and discovered opted-in peers in debug mode
 
@@ -29,8 +29,8 @@ The codebase is best understood as a UI-oriented prototype for a screen-sharing 
 - Material Design UI components
 - JSON-driven environment configuration via `--dart-define-from-file`
 - PowerShell and Bash startup scripts for local execution
-- Rust watcher and USB/Wi-Fi transport core with toolchain setup scripts
-- Dart FFI bridge to the Rust Wi-Fi transport on Windows and Android
+- Rust watcher with UDP, ADB-tunnel TCP, and optional libusb transports
+- Dart FFI bridge to the Rust Wi-Fi and ADB-tunnel transports on Windows and Android
 
 ## Application overview
 
@@ -38,7 +38,7 @@ The main application entry is in `screen_mirror/lib/main.dart`. It creates a `Wa
 
 - status cards for operation mode, communication channel, and stream status
 - action buttons to start or stop transmitting or receiving
-- a live event console reporting actual Wi-Fi frame transport activity
+- a live event console reporting frame transport activity
 - peer selection and opt-in LAN discovery
 - an optional debug inspector panel for on-demand screen capture and host-side ADB device listing
 
@@ -53,7 +53,7 @@ These values are defined in the configuration profiles under `config/` and passe
 
 ## Rust backend
 
-The Rust library in `rust_backend/` is connected to Flutter through a small C ABI and Dart FFI wrapper. It provides mode-checked watcher operations, UDP frame fragmentation/reassembly with sequence tracking and a bounded jitter buffer, and an optional libusb bulk transport. Windows builds compile and bundle the Rust DLL from the Flutter Windows CMake build. Android builds compile armeabi-v7a, arm64-v8a, and x86_64 Rust libraries against the installed NDK before Flutter packages the APK.
+The Rust library in `rust_backend/` is connected to Flutter through a small C ABI and Dart FFI wrapper. It provides mode-checked watcher operations, UDP frame fragmentation/reassembly with sequence tracking and a bounded jitter buffer, TCP framing over ADB forward/reverse tunnels, and an optional libusb bulk transport. Windows builds compile and bundle the Rust DLL from the Flutter Windows CMake build. Android builds compile armeabi-v7a, arm64-v8a, and x86_64 Rust libraries against the installed NDK before Flutter packages the APK.
 
 Run the backend tests with:
 
@@ -64,17 +64,21 @@ cargo test
 
 Enable the hardware USB implementation with `cargo test --features usb` (and `cargo build --features usb` for builds). USB requires the peer device to use the configured interface/endpoints and the backend's 4-byte big-endian frame-length prefix. The UDP transport takes encoded frame bytes from its caller; it does not capture or encode video.
 
-### Current Wi-Fi transport workflow
+### Current Wi-Fi workflow
 
 1. Launch the app on both devices while they are on the same local network.
 2. Press **Discover** on both devices and select the other device from the **Wi-Fi peer** list.
 3. On the receiving device, press **Start Receiving**.
-4. On the sending device, press **Start Transmitting** and approve Android's screen-capture prompt if requested. The app captures and sends one still image. Use **Capture** in the debug panel to send another image.
-5. The receiving app displays the latest received image and logs its byte count.
+4. On the sending device, press **Start Transmitting**. Android asks for screen-capture consent once when the session starts.
+5. The sender continuously captures and transmits JPEG frames (approximately four frames per second on desktop; Android is limited by capture rate). The receiver displays the latest frame.
 
 Both apps must be discoverable and connected to the same LAN; allow the app through host firewalls if prompted. Discovery advertises a TCP presence port and the Rust UDP socket binds to that same local port. Peer addresses currently use IPv4.
 
-This is a working transport slice, not live screen mirroring: each capture sends a single encoded screenshot frame. Continuous capture, video encoding/decoding, audio, encryption, pairing/authentication, and USB device-to-device support are not implemented. UDP frame packets are acknowledged and the sender retries a frame up to three times, but the transport remains unencrypted and should only be used on a trusted LAN.
+### Current USB-tunnel workflow
+
+Connect an Android phone to the desktop over USB, enable ADB debugging, and run peer discovery on the desktop. The desktop applies `adb forward` and `adb reverse` rules for the attached phone; on Android, select **USB Host (ADB tunnel)** and start transmit or receive. The two directions use distinct ADB client ports so their local listeners do not conflict. This is an ADB-backed TCP tunnel, not the standalone libusb bulk transport.
+
+The stream consists of independent JPEG frames; H.264/H.265 encoding, audio, encryption, and peer authentication are not implemented. Wi-Fi UDP frame packets are acknowledged and retried up to three times; the ADB tunnel uses ordered TCP. Both paths remain unencrypted and should only be used on trusted links.
 
 The project launchers build the required native Rust library automatically. The Windows CMake build compiles the DLL. For Android, the launcher uses `config/build/build_android_rust.ps1` on Windows or `config/build/build_android_rust.sh` on Linux. These scripts use the Flutter-selected NDK, install any missing Rust targets, and package the armeabi-v7a, arm64-v8a, and x86_64 libraries for Android API 23 under `screen_mirror/android/app/src/main/jniLibs/`. Direct Flutter Android commands bypass this preparation step; use `run_app.ps1` / `run_app.sh` or run the platform build script first.
 

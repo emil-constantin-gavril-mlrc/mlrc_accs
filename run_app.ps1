@@ -63,6 +63,36 @@ if (-not (Test-Path $ConfigPath)) {
     throw "Configuration file not found: $ConfigPath"
 }
 
+# Toolchain sandbox. Windows may run unsigned local SDK binaries (this repo's
+# bundled dart.exe, and possibly cargo.exe) at Low integrity level, which
+# silently denies every write under AppData and Temp - that kills flutter
+# analyze/build at startup. Redirecting all toolchain write targets into this
+# repo keeps builds independent of that Windows verdict.
+$SandboxRoot = Join-Path $RepoRoot ".toolchain-sandbox"
+foreach ($SandboxDir in @("APPDATA", "Temp", "pub-cache", "cargo-home\registry")) {
+    New-Item -ItemType Directory -Path (Join-Path $SandboxRoot $SandboxDir) -Force | Out-Null
+}
+function Copy-CacheOnce {
+    param([string]$From, [string]$To)
+    if (-not (Test-Path -LiteralPath $From)) { return }
+    if (Get-ChildItem -LiteralPath $To -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1) { return }
+    Write-Host "Seeding build cache one time: $From -> $To" -ForegroundColor Yellow
+    robocopy $From $To /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) {
+        Write-Warning "Cache seeding failed (robocopy exit $LASTEXITCODE); tools will download fresh instead."
+    }
+}
+Copy-CacheOnce -From (Join-Path $env:LOCALAPPDATA "Pub\Cache") -To (Join-Path $SandboxRoot "pub-cache")
+Copy-CacheOnce -From (Join-Path $env:USERPROFILE ".cargo\registry") -To (Join-Path $SandboxRoot "cargo-home\registry")
+$env:APPDATA = Join-Path $SandboxRoot "APPDATA"
+$env:TEMP = Join-Path $SandboxRoot "Temp"
+$env:TMP = $env:TEMP
+$env:PUB_CACHE = Join-Path $SandboxRoot "pub-cache"
+$env:CARGO_HOME = Join-Path $SandboxRoot "cargo-home"
+$env:DART_METRICS_ENABLED = "false"
+$LogDirectory = Join-Path $RepoRoot "logs"
+New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+
 if ($Target -eq "host") {
     $Target = "windows"
 }
@@ -281,6 +311,7 @@ if ($Action -eq "run") {
     $FlutterArgs += if ($ConfigType -eq "debug") { "--debug" } else { "--release" }
 }
 $FlutterArgs += @("--dart-define-from-file=$ConfigPath")
+$FlutterArgs += @("--dart-define=MLRC_LOG_DIR=$LogDirectory")
 
 Write-Host "=== $Action Flutter app ($ConfigType, $Target) ===" -ForegroundColor Cyan
 Write-Host "Using config: $ConfigPath" -ForegroundColor Yellow
